@@ -8,15 +8,24 @@ access token) and scope all work to that verified user. Never trust a
 caller-supplied id; only trust the id derived from a verified token.
 
 Stage 0 endpoints:
-  GET /         -> health check (public)
-  GET /whoami   -> verify token -> resolve member
-  GET /token    -> verify token -> mint a LiveKit join token for the member
+  GET /          -> health check (public)
+  GET /whoami    -> verify token -> resolve member
+  GET /token     -> verify token -> mint a LiveKit join token for the member
+  GET /ops/orgs  -> OPERATOR stub: cross-org summary, gated by an operator key
+
+The /ops/* routes are the company-internal operator surface. They are the one
+place that intentionally reads ACROSS the org boundary (RLS is bypassed by the
+service_role client), so they are gated by a separate shared secret. This is a
+Stage 0 stub; before launch it will be extracted into its own service with
+proper operator identity instead of a shared key.
 
 Config comes from environment variables (set in Cloud Run, never in code):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
   LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+  OPERATOR_API_KEY
 """
 
+import hmac
 import os
 from datetime import timedelta
 
@@ -32,7 +41,9 @@ LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
-app = FastAPI(title="NanoHab Connect API", version="0.2.0")
+OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
+
+app = FastAPI(title="NanoHab Connect API", version="0.3.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -57,7 +68,7 @@ def resolve_member(authorization: str) -> dict:
     The shared 'who is calling?' gate. Read the caller's Supabase access token,
     verify it with Supabase to get the real user, then look up their member row.
     The service_role client bypasses RLS, so scoping is enforced HERE by only
-    querying for the verified user's auth_user_id. Every protected endpoint
+    querying for the verified user's auth_user_id. Every member-facing endpoint
     funnels through this so the trust rule lives in exactly one place.
     """
     if not authorization.startswith("Bearer "):
@@ -88,6 +99,19 @@ def resolve_member(authorization: str) -> dict:
     return rows[0]
 
 
+def require_operator(x_operator_key: str) -> None:
+    """
+    Gate for the company-internal operator surface. Unlike member endpoints
+    (which verify a per-user token), the operator surface is authenticated by a
+    single shared secret held only by company staff. Compared in constant time
+    so a wrong key can't be guessed by timing. Stub-grade by design.
+    """
+    if not OPERATOR_API_KEY:
+        raise HTTPException(status_code=503, detail="Operator API not configured")
+    if not x_operator_key or not hmac.compare_digest(x_operator_key, OPERATOR_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid operator key")
+
+
 @app.get("/")
 def health():
     """Public health check. Reports only whether config is present, no secrets."""
@@ -99,6 +123,7 @@ def health():
         "livekit_configured": bool(
             LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET
         ),
+        "operator_configured": bool(OPERATOR_API_KEY),
     }
 
 
@@ -148,3 +173,29 @@ def token(room: str = "test-room", authorization: str = Header(default="")):
         "room": room,
         "identity": m["id"],
     }
+
+
+@app.get("/ops/orgs")
+def ops_orgs(x_operator_key: str = Header(default="")):
+    """
+    OPERATOR stub: a cross-org summary for company-internal use.
+
+    Returns each org with its member count. This deliberately reads across all
+    orgs (the operator's job), which is exactly why it is locked behind the
+    operator key rather than a member token.
+    """
+    require_operator(x_operator_key)
+
+    client = get_service_client()
+    orgs = (client.table("organizations").select("id, name").execute().data) or []
+    members = (client.table("members").select("org_id").execute().data) or []
+
+    counts: dict = {}
+    for m in members:
+        counts[m["org_id"]] = counts.get(m["org_id"], 0) + 1
+
+    summary = [
+        {"org_id": o["id"], "name": o["name"], "member_count": counts.get(o["id"], 0)}
+        for o in orgs
+    ]
+    return {"org_count": len(summary), "orgs": summary}
