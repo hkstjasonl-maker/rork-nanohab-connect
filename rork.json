@@ -1,0 +1,10 @@
+{
+  "apps": [
+    {
+      "name": "NanoHab Connect",
+      "path": "expo",
+      "framework": "react-native"
+    }
+  ],
+  "$schema": "https://rork.com/schema/rork.json"
+}
