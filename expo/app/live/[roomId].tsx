@@ -53,16 +53,28 @@ type LiveSession = {
   status: string;
   recording_enabled: boolean;
   ai_minutes_enabled: boolean;
+  waiting_room_enabled: boolean;
   started_by: string;
   started_at: string;
   ended_at: string | null;
   livekit_room: string;
 };
 
+type PendingPerson = {
+  member_id: string;
+  full_name: string;
+  requested_at: string;
+};
+
+type JoinStatus = "admitted" | "pending" | "denied";
+
 type Stage =
   | { kind: "prejoin" }
   | { kind: "starting" }
+  | { kind: "admitting"; session: LiveSession }
   | { kind: "consent"; session: LiveSession }
+  | { kind: "waiting"; session: LiveSession }
+  | { kind: "declined" }
   | { kind: "tokenLoading"; session: LiveSession }
   | { kind: "forbidden" }
   | { kind: "error"; message: string; retry: "start" | "token"; session?: LiveSession }
@@ -95,10 +107,11 @@ class ForbiddenError extends Error {
 async function startLiveSession(
   roomId: string,
   recording: boolean,
+  waitingRoom: boolean,
 ): Promise<LiveSession> {
   const headers = await authHeader();
   const res = await fetch(
-    `${backendBase()}/rtc/start?room_id=${encodeURIComponent(roomId)}&recording=${recording}&ai_minutes=${recording}`,
+    `${backendBase()}/rtc/start?room_id=${encodeURIComponent(roomId)}&recording=${recording}&ai_minutes=${recording}&waiting_room=${waitingRoom}`,
     { method: "POST", headers },
   );
   if (res.status === 403) {
@@ -133,12 +146,17 @@ async function endLiveSession(sessionId: string): Promise<void> {
   }
 }
 
-async function fetchRtcToken(roomId: string): Promise<TokenResponse> {
+async function fetchRtcToken(
+  roomId: string,
+): Promise<TokenResponse | "pending"> {
   const headers = await authHeader();
   const res = await fetch(
     `${backendBase()}/rtc/token?room_id=${encodeURIComponent(roomId)}`,
     { method: "GET", headers },
   );
+  if (res.status === 202) {
+    return "pending";
+  }
   if (res.status === 403) {
     throw new ForbiddenError();
   }
@@ -148,11 +166,69 @@ async function fetchRtcToken(roomId: string): Promise<TokenResponse> {
   return (await res.json()) as TokenResponse;
 }
 
+async function requestJoin(sessionId: string): Promise<JoinStatus> {
+  const headers = await authHeader();
+  const res = await fetch(
+    `${backendBase()}/rtc/join-request?session_id=${encodeURIComponent(sessionId)}`,
+    { method: "POST", headers },
+  );
+  if (res.status === 403) {
+    throw new ForbiddenError();
+  }
+  if (!res.ok) {
+    throw new Error(`Could not request admission (status ${res.status}).`);
+  }
+  const body = (await res.json()) as { status: JoinStatus };
+  return body.status;
+}
+
+async function fetchAdmissions(sessionId: string): Promise<PendingPerson[]> {
+  const headers = await authHeader();
+  const res = await fetch(
+    `${backendBase()}/rtc/admissions?session_id=${encodeURIComponent(sessionId)}`,
+    { method: "GET", headers },
+  );
+  if (!res.ok) {
+    throw new Error(`Could not load admissions (status ${res.status}).`);
+  }
+  const body = (await res.json()) as { pending: PendingPerson[] };
+  return body.pending ?? [];
+}
+
+async function admitMember(
+  sessionId: string,
+  memberId: string,
+): Promise<void> {
+  const headers = await authHeader();
+  const res = await fetch(
+    `${backendBase()}/rtc/admit?session_id=${encodeURIComponent(sessionId)}&member_id=${encodeURIComponent(memberId)}`,
+    { method: "POST", headers },
+  );
+  if (!res.ok) {
+    throw new Error(`Could not admit (status ${res.status}).`);
+  }
+}
+
+async function denyMember(
+  sessionId: string,
+  memberId: string,
+): Promise<void> {
+  const headers = await authHeader();
+  const res = await fetch(
+    `${backendBase()}/rtc/deny?session_id=${encodeURIComponent(sessionId)}&member_id=${encodeURIComponent(memberId)}`,
+    { method: "POST", headers },
+  );
+  if (!res.ok) {
+    throw new Error(`Could not deny (status ${res.status}).`);
+  }
+}
+
 export default function LiveCallScreen() {
   const { roomId } = useLocalSearchParams<{ roomId: string }>();
   const router = useRouter();
   const [stage, setStage] = useState<Stage>({ kind: "prejoin" });
   const [recordForAi, setRecordForAi] = useState<boolean>(false);
+  const [waitingRoom, setWaitingRoom] = useState<boolean>(false);
   const [audioReady, setAudioReady] = useState<boolean>(false);
 
   useEffect(() => {
@@ -183,6 +259,10 @@ export default function LiveCallScreen() {
       setStage({ kind: "tokenLoading", session });
       try {
         const token = await fetchRtcToken(roomId);
+        if (token === "pending") {
+          setStage({ kind: "waiting", session });
+          return;
+        }
         setStage({ kind: "ready", session, token });
       } catch (e) {
         if (e instanceof ForbiddenError) {
@@ -198,15 +278,47 @@ export default function LiveCallScreen() {
     [roomId],
   );
 
+  const enterSession = useCallback(
+    async (session: LiveSession) => {
+      if (!session.waiting_room_enabled) {
+        await loadToken(session);
+        return;
+      }
+      setStage({ kind: "admitting", session });
+      try {
+        const status = await requestJoin(session.id);
+        if (status === "admitted") {
+          await loadToken(session);
+          return;
+        }
+        if (status === "denied") {
+          setStage({ kind: "declined" });
+          return;
+        }
+        setStage({ kind: "waiting", session });
+      } catch (e) {
+        if (e instanceof ForbiddenError) {
+          setStage({ kind: "forbidden" });
+          return;
+        }
+        const message =
+          e instanceof Error ? e.message : "Could not request admission.";
+        console.error("Join request failed:", message);
+        setStage({ kind: "error", message, retry: "token", session });
+      }
+    },
+    [loadToken],
+  );
+
   const handleJoin = useCallback(async () => {
     setStage({ kind: "starting" });
     try {
-      const session = await startLiveSession(roomId, recordForAi);
+      const session = await startLiveSession(roomId, recordForAi, waitingRoom);
       if (session.recording_enabled) {
         setStage({ kind: "consent", session });
         return;
       }
-      await loadToken(session);
+      await enterSession(session);
     } catch (e) {
       if (e instanceof ForbiddenError) {
         setStage({ kind: "forbidden" });
@@ -217,14 +329,14 @@ export default function LiveCallScreen() {
       console.error("Start session failed:", message);
       setStage({ kind: "error", message, retry: "start" });
     }
-  }, [roomId, recordForAi, loadToken]);
+  }, [roomId, recordForAi, waitingRoom, enterSession]);
 
   const handleConsent = useCallback(
     async (session: LiveSession) => {
       setStage({ kind: "tokenLoading", session });
       try {
         await sendConsent(session.id);
-        await loadToken(session);
+        await enterSession(session);
       } catch (e) {
         const message =
           e instanceof Error ? e.message : "Could not record consent.";
@@ -232,7 +344,7 @@ export default function LiveCallScreen() {
         setStage({ kind: "error", message, retry: "token", session });
       }
     },
-    [loadToken],
+    [enterSession],
   );
 
   const handleEndSession = useCallback(
@@ -257,12 +369,21 @@ export default function LiveCallScreen() {
     [handleLeave],
   );
 
-  if (!audioReady || stage.kind === "starting" || stage.kind === "tokenLoading") {
+  if (
+    !audioReady ||
+    stage.kind === "starting" ||
+    stage.kind === "admitting" ||
+    stage.kind === "tokenLoading"
+  ) {
     return (
       <Centered>
         <ActivityIndicator color={Theme.primary} size="large" />
         <Text style={styles.statusText}>
-          {stage.kind === "starting" ? "Starting session…" : "Connecting…"}
+          {stage.kind === "starting"
+            ? "Starting session…"
+            : stage.kind === "admitting"
+              ? "Requesting to join…"
+              : "Connecting…"}
         </Text>
       </Centered>
     );
@@ -285,6 +406,23 @@ export default function LiveCallScreen() {
               onValueChange={setRecordForAi}
               trackColor={{ false: "#3A453F", true: Theme.primary }}
               thumbColor="#FFFFFF"
+            />
+          </View>
+          <View style={styles.switchRow}>
+            <View style={styles.switchTextWrap}>
+              <Text style={styles.switchLabel}>
+                Waiting room (admit each person)
+              </Text>
+              <Text style={styles.switchCaption}>
+                You&apos;ll approve each person before they can join.
+              </Text>
+            </View>
+            <Switch
+              value={waitingRoom}
+              onValueChange={setWaitingRoom}
+              trackColor={{ false: "#3A453F", true: Theme.primary }}
+              thumbColor="#FFFFFF"
+              testID="prejoin-waiting-toggle"
             />
           </View>
           <Pressable
@@ -331,6 +469,32 @@ export default function LiveCallScreen() {
             <Text style={styles.linkButtonText}>Leave</Text>
           </Pressable>
         </View>
+      </Centered>
+    );
+  }
+
+  if (stage.kind === "waiting") {
+    return (
+      <WaitingScreen
+        session={stage.session}
+        onAdmitted={loadToken}
+        onDenied={() => setStage({ kind: "declined" })}
+        onForbidden={() => setStage({ kind: "forbidden" })}
+        onLeave={handleLeave}
+      />
+    );
+  }
+
+  if (stage.kind === "declined") {
+    return (
+      <Centered>
+        <Text style={styles.title}>Request declined</Text>
+        <Text style={styles.subtitle}>
+          The host declined your request to join.
+        </Text>
+        <Pressable style={styles.backButton} onPress={handleLeave}>
+          <Text style={styles.backButtonText}>Back</Text>
+        </Pressable>
       </Centered>
     );
   }
@@ -387,6 +551,79 @@ export default function LiveCallScreen() {
   );
 }
 
+function WaitingScreen({
+  session,
+  onAdmitted,
+  onDenied,
+  onForbidden,
+  onLeave,
+}: {
+  session: LiveSession;
+  onAdmitted: (session: LiveSession) => void;
+  onDenied: () => void;
+  onForbidden: () => void;
+  onLeave: () => void;
+}) {
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const status = await requestJoin(session.id);
+        if (!active) {
+          return;
+        }
+        if (status === "admitted") {
+          onAdmitted(session);
+          return;
+        }
+        if (status === "denied") {
+          onDenied();
+          return;
+        }
+        timer = setTimeout(poll, 2000);
+      } catch (e) {
+        if (!active) {
+          return;
+        }
+        if (e instanceof ForbiddenError) {
+          onForbidden();
+          return;
+        }
+        console.error("Admission poll failed:", e);
+        timer = setTimeout(poll, 2000);
+      }
+    };
+    timer = setTimeout(poll, 2000);
+    return () => {
+      active = false;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [session, onAdmitted, onDenied, onForbidden]);
+
+  return (
+    <Centered>
+      <View testID="waiting-screen" style={styles.centered}>
+        <ActivityIndicator color={Theme.primary} size="large" />
+        <Text style={styles.title}>Waiting to be admitted</Text>
+        <Text style={styles.subtitle}>
+          The host has been notified. You&apos;ll join automatically once they
+          let you in.
+        </Text>
+        <Pressable
+          style={styles.backButton}
+          onPress={onLeave}
+          testID="waiting-leave"
+        >
+          <Text style={styles.backButtonText}>Leave</Text>
+        </Pressable>
+      </View>
+    </Centered>
+  );
+}
+
 function Centered({ children }: { children: React.ReactNode }) {
   return (
     <View style={styles.fill}>
@@ -440,6 +677,57 @@ function CallContents({
     useLocalParticipant();
   const cameraTracks = useTracks([Track.Source.Camera]);
 
+  const canEnd = tokenIdentity === session.started_by;
+  const [pending, setPending] = useState<PendingPerson[]>([]);
+
+  useEffect(() => {
+    if (!canEnd) {
+      return;
+    }
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const list = await fetchAdmissions(session.id);
+        if (active) {
+          setPending(list);
+        }
+      } catch (e) {
+        console.error("Admissions poll failed:", e);
+      }
+      if (active) {
+        timer = setTimeout(poll, 2000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [canEnd, session.id]);
+
+  const handleAdmit = useCallback(
+    (memberId: string) => {
+      setPending((prev) => prev.filter((p) => p.member_id !== memberId));
+      admitMember(session.id, memberId).catch((e: unknown) => {
+        console.error("Admit failed:", e);
+      });
+    },
+    [session.id],
+  );
+
+  const handleDeny = useCallback(
+    (memberId: string) => {
+      setPending((prev) => prev.filter((p) => p.member_id !== memberId));
+      denyMember(session.id, memberId).catch((e: unknown) => {
+        console.error("Deny failed:", e);
+      });
+    },
+    [session.id],
+  );
+
   const toggleMic = useCallback(() => {
     const next = !isMicrophoneEnabled;
     localParticipant.setMicrophoneEnabled(next).catch((e: unknown) => {
@@ -459,7 +747,6 @@ function CallContents({
     [connectionState],
   );
 
-  const canEnd = tokenIdentity === session.started_by;
   const count = participants.length;
   const oneColumn = count <= 2;
   const isScroll = count > 4;
@@ -506,6 +793,40 @@ function CallContents({
           <Text style={styles.statusPillText}>{status}</Text>
         </View>
       </View>
+
+      {canEnd && pending.length > 0 ? (
+        <View
+          testID="knock-banner"
+          style={[styles.knockBanner, { marginTop: 12 }]}
+        >
+          <Text style={styles.knockHeading}>
+            Waiting to be admitted
+          </Text>
+          {pending.map((p) => (
+            <View key={p.member_id} style={styles.knockRow}>
+              <Text style={styles.knockName} numberOfLines={1}>
+                {p.full_name}
+              </Text>
+              <View style={styles.knockActions}>
+                <Pressable
+                  style={styles.knockAdmit}
+                  onPress={() => handleAdmit(p.member_id)}
+                  testID="knock-admit"
+                >
+                  <Text style={styles.knockAdmitText}>Admit</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.knockDeny}
+                  onPress={() => handleDeny(p.member_id)}
+                  testID="knock-deny"
+                >
+                  <Text style={styles.knockDenyText}>Deny</Text>
+                </Pressable>
+              </View>
+            </View>
+          ))}
+        </View>
+      ) : null}
 
       {grid}
 
@@ -676,6 +997,39 @@ const styles = StyleSheet.create({
     borderRadius: 16,
   },
   statusPillText: { color: Theme.surface, fontSize: 13, fontWeight: "600" },
+  knockBanner: {
+    marginHorizontal: 16,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderRadius: 16,
+    padding: 14,
+    gap: 10,
+  },
+  knockHeading: {
+    color: "#C7D0CB",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  knockRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  knockName: { flex: 1, color: "#FFFFFF", fontSize: 15, fontWeight: "600" },
+  knockActions: { flexDirection: "row", alignItems: "center", gap: 8 },
+  knockAdmit: {
+    backgroundColor: Theme.primary,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+  },
+  knockAdmitText: { color: "#FFFFFF", fontSize: 14, fontWeight: "700" },
+  knockDeny: {
+    backgroundColor: "rgba(255,255,255,0.12)",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+  },
+  knockDenyText: { color: "#C7D0CB", fontSize: 14, fontWeight: "600" },
   waitingWrap: {
     flex: 1,
     alignItems: "center",
