@@ -1,4 +1,4 @@
-"""
+﻿"""
 NanoHab Connect — backend API (Cloud Run).
 
 This is the TRUSTED server. It is the ONLY place the Supabase service_role key
@@ -10,14 +10,9 @@ caller-supplied id; only trust the id derived from a verified token.
 Stage 0 endpoints:
   GET /          -> health check (public)
   GET /whoami    -> verify token -> resolve member
-  GET /token     -> verify token -> mint a LiveKit join token for the member
+  GET /token     -> verify token -> mint a LiveKit join token (legacy/test)
+  GET /rtc/token -> verify token + room membership -> room-scoped LiveKit token
   GET /ops/orgs  -> OPERATOR stub: cross-org summary, gated by an operator key
-
-The /ops/* routes are the company-internal operator surface. They are the one
-place that intentionally reads ACROSS the org boundary (RLS is bypassed by the
-service_role client), so they are gated by a separate shared secret. This is a
-Stage 0 stub; before launch it will be extracted into its own service with
-proper operator identity instead of a shared key.
 
 Config comes from environment variables (set in Cloud Run, never in code):
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -43,10 +38,8 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
 
-app = FastAPI(title="NanoHab Connect API", version="0.3.0")
+app = FastAPI(title="NanoHab Connect API", version="0.4.0")
 
-# CORS: permissive for now so the app/guest web can call during early build.
-# We will tighten allow_origins to the real app/web origins before launch.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,13 +57,7 @@ def get_service_client() -> Client:
 
 
 def resolve_member(authorization: str) -> dict:
-    """
-    The shared 'who is calling?' gate. Read the caller's Supabase access token,
-    verify it with Supabase to get the real user, then look up their member row.
-    The service_role client bypasses RLS, so scoping is enforced HERE by only
-    querying for the verified user's auth_user_id. Every member-facing endpoint
-    funnels through this so the trust rule lives in exactly one place.
-    """
+    """Verify the caller's Supabase access token and resolve their member row."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
@@ -100,12 +87,7 @@ def resolve_member(authorization: str) -> dict:
 
 
 def require_operator(x_operator_key: str) -> None:
-    """
-    Gate for the company-internal operator surface. Unlike member endpoints
-    (which verify a per-user token), the operator surface is authenticated by a
-    single shared secret held only by company staff. Compared in constant time
-    so a wrong key can't be guessed by timing. Stub-grade by design.
-    """
+    """Gate for the company-internal operator surface (shared secret, constant-time)."""
     if not OPERATOR_API_KEY:
         raise HTTPException(status_code=503, detail="Operator API not configured")
     if not x_operator_key or not hmac.compare_digest(x_operator_key, OPERATOR_API_KEY):
@@ -141,14 +123,7 @@ def whoami(authorization: str = Header(default="")):
 
 @app.get("/token")
 def token(room: str = "test-room", authorization: str = Header(default="")):
-    """
-    Mint a LiveKit join token for the verified member.
-
-    Stage 0: 'room' is an arbitrary test room name (the real case/room model
-    arrives in Stage A). The token's identity is the member id and the display
-    name is the member's full name, so a call participant is always a verified
-    member of an org — never an anonymous caller-supplied identity.
-    """
+    """Legacy/test: mint a LiveKit token for an arbitrary room name (no membership check)."""
     if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
         raise HTTPException(status_code=500, detail="LiveKit is not configured")
 
@@ -175,15 +150,56 @@ def token(room: str = "test-room", authorization: str = Header(default="")):
     }
 
 
+@app.get("/rtc/token")
+def rtc_token(room_id: str, authorization: str = Header(default="")):
+    """
+    Room-scoped LiveKit join token (Stage A7).
+
+    Mints a token ONLY if the verified caller is a member of the given room.
+    The LiveKit room name is the room's UUID, so a caller can never obtain
+    audio into a room they do not belong to, even if they know its id.
+    """
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(status_code=500, detail="LiveKit is not configured")
+
+    m = resolve_member(authorization)
+
+    client = get_service_client()
+    res = (
+        client.table("room_members")
+        .select("id")
+        .eq("room_id", room_id)
+        .eq("member_id", m["id"])
+        .limit(1)
+        .execute()
+    )
+    if not (res.data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    grants = livekit_api.VideoGrants(
+        room_join=True,
+        room=room_id,
+        can_publish=True,
+        can_subscribe=True,
+    )
+    access = (
+        livekit_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(m["id"])
+        .with_name(m["full_name"])
+        .with_grants(grants)
+        .with_ttl(timedelta(hours=2))
+    )
+    return {
+        "token": access.to_jwt(),
+        "url": LIVEKIT_URL,
+        "room": room_id,
+        "identity": m["id"],
+    }
+
+
 @app.get("/ops/orgs")
 def ops_orgs(x_operator_key: str = Header(default="")):
-    """
-    OPERATOR stub: a cross-org summary for company-internal use.
-
-    Returns each org with its member count. This deliberately reads across all
-    orgs (the operator's job), which is exactly why it is locked behind the
-    operator key rather than a member token.
-    """
+    """OPERATOR stub: cross-org summary, gated by the operator key."""
     require_operator(x_operator_key)
 
     client = get_service_client()
