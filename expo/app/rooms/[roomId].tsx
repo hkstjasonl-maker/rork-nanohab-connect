@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Stack, useLocalSearchParams } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenCapture from "expo-screen-capture";
-import { Send, UserPlus, X } from "lucide-react-native";
+import { Headphones, Send, UserPlus, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -114,6 +114,7 @@ async function fetchAddableMembers(
 
 export default function RoomThreadScreen() {
   const { roomId } = useLocalSearchParams<{ roomId: string }>();
+  const router = useRouter();
   const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
   const listRef = useRef<FlatList<MessageRow>>(null);
@@ -223,13 +224,22 @@ export default function RoomThreadScreen() {
           title: headerTitle,
           headerBackTitle: "Case",
           headerRight: () => (
-            <Pressable
-              onPress={() => setIsAddOpen(true)}
-              hitSlop={12}
-              testID="add-member-button"
-            >
-              <UserPlus color={Theme.primary} size={22} />
-            </Pressable>
+            <View style={styles.headerActions}>
+              <Pressable
+                onPress={() => router.push(`/live/${roomId}`)}
+                hitSlop={12}
+                testID="go-live-button"
+              >
+                <Headphones color={Theme.primary} size={22} />
+              </Pressable>
+              <Pressable
+                onPress={() => setIsAddOpen(true)}
+                hitSlop={12}
+                testID="add-member-button"
+              >
+                <UserPlus color={Theme.primary} size={22} />
+              </Pressable>
+            </View>
           ),
         }}
       />
@@ -352,6 +362,7 @@ export default function RoomThreadScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Theme.background },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 20 },
   loader: { marginTop: 40 },
   listContent: { padding: 20, gap: 16, flexGrow: 1 },
   message: {

@@ -15,14 +15,18 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "app.rork.ag5q1m44nj10dtr3lbso3"
+      "bundleIdentifier": "app.rork.ag5q1m44nj10dtr3lbso3",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "NanoHab Connect uses your microphone for case calls."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "app.rork.ag5q1m44nj10dtr3lbso3"
+      "package": "app.rork.ag5q1m44nj10dtr3lbso3",
+      "permissions": ["RECORD_AUDIO"]
     },
     "web": {
       "favicon": "./assets/images/favicon.png"
@@ -35,7 +39,16 @@
         }
       ],
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      [
+        "@livekit/react-native-expo-plugin",
+        {
+          "android": {
+            "audioType": "communication"
+          }
+        }
+      ],
+      "@config-plugins/react-native-webrtc"
     ],
     "experiments": {
       "typedRoutes": true
