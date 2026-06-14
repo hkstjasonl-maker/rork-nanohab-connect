@@ -61,7 +61,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.8.0")
+app = FastAPI(title="NanoHab Connect API", version="0.9.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -505,6 +505,8 @@ class AzureStructurer:
         "keep clean prose. "
         "6) NEVER invent clinical facts, names, numbers, or recommendations not in the transcript; "
         "if unclear, preserve rather than guess. "
+        "7) Output in Traditional Chinese (\u7e41\u9ad4\u4e2d\u6587, Hong Kong convention); "
+        "preserve English terms exactly as written; never output Simplified Chinese. "
         "Output only the cleaned draft note text, with no preamble."
     )
 
