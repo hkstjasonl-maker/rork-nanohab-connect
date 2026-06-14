@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "NanoHab Connect",
-    "slug": "ag5q1m44nj10dtr3lbso3",
+    "slug": "nanohab-connect",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -15,18 +15,30 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "app.rork.ag5q1m44nj10dtr3lbso3",
+      "bundleIdentifier": "com.dravive.nanohabconnect",
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "NanoHab Connect uses your microphone for case calls."
-      }
+        "NSMicrophoneUsageDescription": "NanoHab Connect uses your microphone for case calls.",
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "bitcode": false
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "app.rork.ag5q1m44nj10dtr3lbso3",
-      "permissions": ["RECORD_AUDIO"]
+      "package": "com.dravive.nanohabconnect",
+      "permissions": [
+        "RECORD_AUDIO",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WAKE_LOCK",
+        "android.permission.BLUETOOTH"
+      ]
     },
     "web": {
       "favicon": "./assets/images/favicon.png"
@@ -52,6 +64,14 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {
+        "origin": "https://rork.com/"
+      },
+      "eas": {
+        "projectId": "454385b0-dd4c-4961-8045-455da2696a4b"
+      }
     }
   }
 }
