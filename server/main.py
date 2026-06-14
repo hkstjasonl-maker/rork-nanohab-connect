@@ -61,7 +61,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.9.0")
+app = FastAPI(title="NanoHab Connect API", version="0.10.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -616,3 +616,86 @@ def ops_orgs(x_operator_key: str = Header(default="")):
         for o in orgs
     ]
     return {"org_count": len(summary), "orgs": summary}
+
+
+# ============================================================================
+# Stage B - Slice 1: live-session lifecycle + consent (the multi-party spine).
+# Thin endpoints: authenticate the member from their bearer token, then call a
+# service-role RPC that does authorization + the atomic write. Same two-lane
+# pattern as /rtc/token and /structure.
+# ============================================================================
+def _rpc(client, fn: str, params: dict):
+    """Call a service-role RPC and map known SQL errors to HTTP status codes."""
+    try:
+        return client.rpc(fn, params).execute().data
+    except HTTPException:
+        raise
+    except Exception as e:  # supabase-py raises on a Postgres error
+        msg = str(e)
+        if "Not a member" in msg or "can end it" in msg or "42501" in msg:
+            raise HTTPException(status_code=403, detail="Not authorized for this room")
+        if "No such" in msg:
+            raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=500, detail="Live-session operation failed")
+
+
+@app.post("/rtc/start")
+def rtc_start(
+    room_id: str,
+    recording: bool = False,
+    ai_minutes: bool = False,
+    authorization: str = Header(default=""),
+):
+    """
+    Start (or join) the room's live session. Idempotent: if the room is already
+    live, returns the existing session rather than erroring. The caller must be
+    a member of the room (enforced inside svc_start_live_session).
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_start_live_session", {
+        "p_room_id": room_id,
+        "p_member_id": m["id"],
+        "p_recording": recording,
+        "p_ai_minutes": ai_minutes,
+    })
+    return {"session": data}
+
+
+@app.post("/rtc/end")
+def rtc_end(session_id: str, authorization: str = Header(default="")):
+    """
+    End a live session. Only the room host or the member who started it may end
+    it (enforced inside svc_end_live_session). Returns the room to 'open'.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_end_live_session", {
+        "p_session_id": session_id,
+        "p_member_id": m["id"],
+    })
+    return {"session": data}
+
+
+@app.post("/rtc/consent")
+def rtc_consent(
+    session_id: str,
+    recording: bool,
+    ai: bool,
+    text_version: str = "",
+    authorization: str = Header(default=""),
+):
+    """
+    Record (upsert) the calling member's recording + AI consent for a session.
+    One row per member per session; re-submitting updates in place.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_record_consent", {
+        "p_session_id": session_id,
+        "p_member_id": m["id"],
+        "p_recording": recording,
+        "p_ai": ai,
+        "p_text_version": (text_version or None),
+    })
+    return {"consent": data}
