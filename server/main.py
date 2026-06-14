@@ -55,7 +55,13 @@ AZURE_FAST_API_VERSION = os.environ.get("AZURE_FAST_API_VERSION", "2025-10-15")
 # Batch fallback requires a locale; default to Cantonese (HK).
 AZURE_BATCH_LOCALE = os.environ.get("AZURE_BATCH_LOCALE", "zh-HK")
 
-app = FastAPI(title="NanoHab Connect API", version="0.7.0")
+# Azure OpenAI (note structuring LLM). Absent until provisioned -> uses fake.
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+
+app = FastAPI(title="NanoHab Connect API", version="0.8.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -479,8 +485,56 @@ class FakeStructurer:
         )
 
 
+class AzureStructurer:
+    # Provenance LABEL, never a model name (matches the NanoHab "review_v1" rule).
+    name = "review_v1"
+
+    SYSTEM = (
+        "You are a clinical documentation assistant for a Hong Kong speech therapy team. "
+        "You receive a raw speech-to-text transcript of a clinician's spoken voice note. "
+        "The transcript is Hong Kong Cantonese mixed with English clinical terms and may contain "
+        "speech-to-text errors, especially at Cantonese-English boundaries (an English word split "
+        "into Chinese characters). Produce a cleaned, structured DRAFT note for the clinician to "
+        "review. Rules: "
+        "1) Correct obvious transcription errors using clinical context, especially mis-split "
+        "English terms (for example '\u5730fer' -> 'defer'). "
+        "2) Use Hong Kong written-Cantonese conventions (for example write '\u54b3' not '\u5662'). "
+        "3) Add natural punctuation. "
+        "4) Keep the original language mix; do NOT translate Cantonese to English or vice versa. "
+        "5) Structure concisely when the content supports it (e.g. observation, plan); otherwise "
+        "keep clean prose. "
+        "6) NEVER invent clinical facts, names, numbers, or recommendations not in the transcript; "
+        "if unclear, preserve rather than guess. "
+        "Output only the cleaned draft note text, with no preamble."
+    )
+
+    def __init__(self, endpoint: str, key: str, deployment: str, api_version: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.key, self.deployment, self.api_version = key, deployment, api_version
+
+    def structure(self, transcript: str, language: str) -> str:
+        url = (f"{self.endpoint}/openai/deployments/{self.deployment}"
+               f"/chat/completions?api-version={self.api_version}")
+        body = {
+            "messages": [
+                {"role": "system", "content": self.SYSTEM},
+                {"role": "user", "content": (transcript or "").strip()},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 800,
+        }
+        r = httpx.post(url, headers={"api-key": self.key, "Content-Type": "application/json"},
+                       json=body, timeout=60)
+        r.raise_for_status()
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
 def get_structurer(language: str):
-    """Routing seam: pick the LLM engine per language/use. One fake for now."""
+    """Routing seam. Real Azure OpenAI when configured; fake otherwise so deploys
+    never break pre-key. Engine identity is the LABEL name, not the model."""
+    if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT:
+        return AzureStructurer(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY,
+                               AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION)
     return FakeStructurer()
 
 
