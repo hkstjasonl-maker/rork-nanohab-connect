@@ -26,9 +26,12 @@ Config comes from environment variables (set in Cloud Run, never in code):
 """
 
 import hmac
+import json
 import os
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
@@ -43,7 +46,16 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
 
-app = FastAPI(title="NanoHab Connect API", version="0.6.0")
+# Azure AI Speech (transcription). Absent until provisioned -> worker uses fakes.
+AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
+AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "")
+# Fast path: blank locales = latest multilingual model (best for HK code-mixing).
+AZURE_SPEECH_LOCALES = os.environ.get("AZURE_SPEECH_LOCALES", "")
+AZURE_FAST_API_VERSION = os.environ.get("AZURE_FAST_API_VERSION", "2025-10-15")
+# Batch fallback requires a locale; default to Cantonese (HK).
+AZURE_BATCH_LOCALE = os.environ.get("AZURE_BATCH_LOCALE", "zh-HK")
+
+app = FastAPI(title="NanoHab Connect API", version="0.7.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -227,80 +239,220 @@ def rtc_token(room_id: str, authorization: str = Header(default="")):
 
 
 # ----------------------------------------------------------------------------
-# Transcription worker (Stage A8.2b)
+# Transcription worker (Stage A8.2c) — two engines: FAST primary, BATCH fallback
 #
-# The queue (jobs, concurrency cap, retry/backoff, per-org quota) lives in the
-# database. This worker is the drain: it claims due jobs, transcribes each via a
-# PLUGGABLE engine, then completes or fails them through the SQL RPCs. The
-# engine is swappable — the fake below proves the loop with no provider/keys;
-# real engines (Azure zh-HK, a self-hosted Cantonese model) implement the same
-# transcribe(audio, language) -> (text, seconds) contract and slot into
-# get_transcriber(). That routing seam is how "both engines" stays cheap.
+# Strategy (decided with the user): fast transcription (synchronous, seconds) is
+# the primary; batch transcription (async, no RPM wall) is the fallback. The
+# QUEUE (008/012) owns retry/backoff/concurrency/quota and the fast->batch
+# switch; this worker just drives whichever engine a claimed job is in.
+#
+#   FAST  : download audio bytes from the private bucket -> POST inline to Azure
+#           -> transcript back in one call. Default multilingual model (no
+#           locale) — best for HK Cantonese-English code-mixing.
+#   BATCH : Azure fetches the audio by URL, so the worker mints a SHORT-LIVED
+#           (30 min) Supabase signed URL, submits the job, and parks it
+#           ('awaiting'); a later /drain pass polls and finalizes it. The signed
+#           URL is never logged or stored — only its expiry is recorded.
+#
+# Engines are swappable behind get_transcriber(): real Azure when the key is
+# set, fakes otherwise — so deploying this changes NOTHING until AZURE_SPEECH_KEY
+# is present. Engine identity is stored per transcript (transcript_engine).
 # ----------------------------------------------------------------------------
 
 
-class FakeTranscriber:
-    """Stand-in engine: returns a canned transcript so we can prove the drain
-    loop end-to-end without any provider, key, or cost."""
-
-    name = "fake_v0"
-
-    def transcribe(self, audio: bytes, language: str):
-        return (f"[fake transcript \u00b7 {language}]", 5)
+class RateLimited(Exception):
+    """Fast engine throttled (HTTP 429). The queue retries fast a few times,
+    then falls back to batch — handled by fail_transcription_job."""
 
 
-def get_transcriber(language: str):
-    """Routing seam for 'both engines': choose the engine per language. For now
-    one fake engine; later e.g. a self-hosted Cantonese model for 'yue' and
-    Azure zh-HK for 'en'/'cmn', with failover between them."""
-    return FakeTranscriber()
+class FastTranscriber:
+    name = "azure_fast_v1"
+
+    def __init__(self, key: str, region: str, locales: str, api_version: str):
+        self.key, self.region, self.locales, self.api_version = key, region, locales, api_version
+
+    def transcribe(self, audio: bytes):
+        url = (
+            f"https://{self.region}.api.cognitive.microsoft.com"
+            f"/speechtotext/transcriptions:transcribe?api-version={self.api_version}"
+        )
+        definition: dict = {}
+        if self.locales:
+            definition["locales"] = [s.strip() for s in self.locales.split(",") if s.strip()]
+        files = {
+            "audio": ("audio.m4a", audio, "application/octet-stream"),
+            "definition": (None, json.dumps(definition), "application/json"),
+        }
+        r = httpx.post(url, headers={"Ocp-Apim-Subscription-Key": self.key}, files=files, timeout=120)
+        if r.status_code == 429:
+            raise RateLimited("fast transcription rate-limited (429)")
+        r.raise_for_status()
+        data = r.json()
+        phrases = data.get("combinedPhrases") or []
+        text = " ".join(p.get("text", "") for p in phrases).strip()
+        seconds = int(round((data.get("durationMilliseconds") or 0) / 1000)) or 1
+        return text, seconds
+
+
+class BatchTranscriber:
+    name = "azure_batch_v1"
+
+    def __init__(self, key: str, region: str, locale: str):
+        self.key, self.locale = key, locale
+        self.base = f"https://{region}.api.cognitive.microsoft.com/speechtotext/v3.2"
+
+    def _h(self):
+        return {"Ocp-Apim-Subscription-Key": self.key}
+
+    def submit(self, content_url: str) -> str:
+        body = {
+            "contentUrls": [content_url],
+            "locale": self.locale,
+            "displayName": "nanohab-connect voice note",
+            "properties": {"timeToLiveHours": 6},
+        }
+        r = httpx.post(self.base + "/transcriptions", headers={**self._h(),
+                       "Content-Type": "application/json"}, json=body, timeout=60)
+        r.raise_for_status()
+        return r.json()["self"]  # the job URL we poll later
+
+    def poll(self, job_url: str):
+        r = httpx.get(job_url, headers=self._h(), timeout=60)
+        r.raise_for_status()
+        status = r.json().get("status")
+        if status in ("NotStarted", "Running"):
+            return ("pending", None, None)
+        if status == "Failed":
+            raise RuntimeError("batch transcription failed")
+        # Succeeded: fetch the transcription result file and parse it.
+        fr = httpx.get(job_url + "/files", headers=self._h(), timeout=60)
+        fr.raise_for_status()
+        files = fr.json().get("values", [])
+        turl = next((f["links"]["contentUrl"] for f in files if f.get("kind") == "Transcription"), None)
+        if not turl:
+            raise RuntimeError("batch result file missing")
+        tr = httpx.get(turl, timeout=60)  # contentUrl is pre-authorized by Azure
+        tr.raise_for_status()
+        res = tr.json()
+        phrases = res.get("combinedRecognizedPhrases") or []
+        text = " ".join(p.get("display", "") for p in phrases).strip()
+        seconds = int(round((res.get("durationInTicks") or 0) / 10_000_000)) or 1
+        return ("done", text, seconds)
+
+
+class FakeFast:
+    name = "fake_fast_v0"
+
+    def transcribe(self, audio: bytes):
+        return ("[fake fast transcript \u00b7 yue]", 5)
+
+
+class FakeBatch:
+    name = "fake_batch_v0"
+
+    def submit(self, content_url: str) -> str:
+        return "https://fake.local/transcriptions/" + uuid.uuid4().hex
+
+    def poll(self, job_url: str):
+        return ("done", "[fake batch transcript \u00b7 yue]", 5)
+
+
+def get_transcriber():
+    """Routing seam. Returns (fast_primary, batch_fallback). Real Azure engines
+    when the key is set; fakes otherwise so deploys never break pre-key."""
+    if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        return (
+            FastTranscriber(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION, AZURE_SPEECH_LOCALES, AZURE_FAST_API_VERSION),
+            BatchTranscriber(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION, AZURE_BATCH_LOCALE),
+        )
+    return FakeFast(), FakeBatch()
+
+
+def _artifact_audio_path(client, artifact_id: str) -> str:
+    rows = (client.table("ai_artifacts").select("audio_path")
+            .eq("id", artifact_id).limit(1).execute().data) or []
+    if not rows or not rows[0].get("audio_path"):
+        raise RuntimeError("artifact has no audio_path")
+    return rows[0]["audio_path"]
+
+
+def _download_audio(client, artifact_id: str) -> bytes:
+    """Fast path: pull the audio bytes from the private bucket (service role)."""
+    return client.storage.from_("voice-notes").download(_artifact_audio_path(client, artifact_id))
+
+
+def _signed_audio_url(client, artifact_id: str, expires_seconds: int = 1800):
+    """Batch path: mint a short-lived signed URL Azure can fetch. The URL is a
+    time-boxed read capability; we return it for immediate use and record only
+    its EXPIRY in the DB — never the URL itself."""
+    path = _artifact_audio_path(client, artifact_id)
+    res = client.storage.from_("voice-notes").create_signed_url(path, expires_seconds)
+    url = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
+    if not url:
+        raise RuntimeError("could not mint signed url")
+    if url.startswith("/"):
+        url = SUPABASE_URL + url
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)).isoformat()
+    return url, expires_at
 
 
 @app.post("/drain")
 def drain(x_operator_key: str = Header(default=""), limit: int = 10):
     """
-    Drain the transcription queue, within the DB-enforced concurrency cap.
-
-    Intended to be called on a schedule (Cloud Scheduler). Claims due jobs,
-    transcribes each through the pluggable engine, and records the outcome:
-    success -> set_transcript + complete_transcription_job (usage metered);
-    failure -> fail_transcription_job (retry with backoff, then dead-letter).
-    A failed transcription never loses the recording — the artifact stays put.
-    Gated by the operator key, like the other /ops surface.
+    Drain the transcription queue. Two phases per call:
+      1. Claim queued jobs (under the concurrency cap) and act by engine phase:
+         fast  -> download bytes, transcribe synchronously, set_transcript+complete
+         batch -> mint signed URL, submit job, park as 'awaiting'
+      2. Poll 'awaiting' batch jobs: on success set_transcript+complete; on
+         failure/expiry fail (retry/backoff/dead-letter).
+    Any engine error -> fail_transcription_job (the recording is never lost).
+    Gated by the operator key; intended to run on a Cloud Scheduler cadence.
     """
     require_operator(x_operator_key)
     client = get_service_client()
+    fast, batch = get_transcriber()
+    s = {"fast_done": 0, "batch_submitted": 0, "batch_done": 0, "pending": 0, "failed": 0}
 
+    # Phase 1 — claim and act
     claimed = (client.rpc("claim_transcription_jobs", {"p_limit": limit}).execute().data) or []
-    summary = {"claimed": len(claimed), "succeeded": 0, "failed": 0}
-
     for job in claimed:
-        job_id = job["job_id"]
-        artifact_id = job["artifact_id"]
+        jid, aid, phase = job["job_id"], job["artifact_id"], job.get("engine_phase", "fast")
         try:
-            # A real engine would download the audio from storage here; the fake
-            # engine ignores it. Language will come from the artifact's chosen
-            # language once the record-time selector ships; default Cantonese.
-            language = "yue"
-            engine = get_transcriber(language)
-            text, seconds = engine.transcribe(b"", language)
-            client.rpc(
-                "set_transcript",
-                {"p_artifact_id": artifact_id, "p_transcript": text, "p_engine": engine.name},
-            ).execute()
-            client.rpc(
-                "complete_transcription_job",
-                {"p_job_id": job_id, "p_seconds": seconds},
-            ).execute()
-            summary["succeeded"] += 1
-        except Exception as e:  # noqa: BLE001 - any engine error -> fail the job
-            client.rpc(
-                "fail_transcription_job",
-                {"p_job_id": job_id, "p_error": str(e)[:500]},
-            ).execute()
-            summary["failed"] += 1
+            if phase == "fast":
+                audio = _download_audio(client, aid)
+                text, seconds = fast.transcribe(audio)
+                client.rpc("set_transcript", {"p_artifact_id": aid, "p_transcript": text,
+                           "p_engine": fast.name}).execute()
+                client.rpc("complete_transcription_job", {"p_job_id": jid, "p_seconds": seconds}).execute()
+                s["fast_done"] += 1
+            else:
+                signed_url, expires_at = _signed_audio_url(client, aid)
+                job_url = batch.submit(signed_url)
+                client.rpc("await_transcription_job", {"p_job_id": jid, "p_azure_job_url": job_url,
+                           "p_expires_at": expires_at}).execute()
+                s["batch_submitted"] += 1
+        except Exception as e:  # noqa: BLE001 — any engine error -> fail (retry/switch/dead-letter)
+            client.rpc("fail_transcription_job", {"p_job_id": jid, "p_error": str(e)[:500]}).execute()
+            s["failed"] += 1
 
-    return summary
+    # Phase 2 — poll awaiting batch jobs
+    awaiting = (client.rpc("list_awaiting_jobs", {"p_limit": limit}).execute().data) or []
+    for job in awaiting:
+        jid, aid, job_url = job["job_id"], job["artifact_id"], job["azure_job_url"]
+        try:
+            status, text, seconds = batch.poll(job_url)
+            if status == "done":
+                client.rpc("set_transcript", {"p_artifact_id": aid, "p_transcript": text,
+                           "p_engine": batch.name}).execute()
+                client.rpc("complete_transcription_job", {"p_job_id": jid, "p_seconds": seconds or 0}).execute()
+                s["batch_done"] += 1
+            else:
+                s["pending"] += 1
+        except Exception as e:  # noqa: BLE001
+            client.rpc("fail_transcription_job", {"p_job_id": jid, "p_error": str(e)[:500]}).execute()
+            s["failed"] += 1
+
+    return s
 
 
 # ----------------------------------------------------------------------------
