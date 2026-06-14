@@ -38,6 +38,8 @@ function RootLayoutNav() {
       <Stack.Screen name="cases/index" options={{ headerShown: false }} />
       <Stack.Screen name="cases/[caseId]" options={{ title: "Case" }} />
       <Stack.Screen name="rooms/[roomId]" options={{ title: "Room" }} />
+      <Stack.Screen name="notes/[roomId]" options={{ title: "Voice notes" }} />
+      <Stack.Screen name="note/[artifactId]" options={{ title: "Review note" }} />
       <Stack.Screen
         name="live/[roomId]"
         options={{ headerShown: false, presentation: "fullScreenModal" }}

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenCapture from "expo-screen-capture";
-import { Headphones, Send, UserPlus, X } from "lucide-react-native";
+import { Headphones, Mic, Send, UserPlus, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -231,6 +231,13 @@ export default function RoomThreadScreen() {
                 testID="go-live-button"
               >
                 <Headphones color={Theme.primary} size={22} />
+              </Pressable>
+              <Pressable
+                onPress={() => router.push(`/notes/${roomId}`)}
+                hitSlop={12}
+                testID="voice-notes-button"
+              >
+                <Mic color={Theme.primary} size={22} />
               </Pressable>
               <Pressable
                 onPress={() => setIsAddOpen(true)}
