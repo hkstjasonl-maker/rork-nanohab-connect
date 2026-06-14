@@ -1,3 +1,5 @@
+import { File } from 'expo-file-system';
+import { decode } from 'base64-arraybuffer';
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Audio } from "expo-av";
 import { randomUUID } from "expo-crypto";
@@ -205,11 +207,10 @@ export default function VoiceNotesScreen() {
       // First folder MUST be roomId — storage RLS authorizes on it.
       const path = `${roomId}/${file}`;
 
-      const res = await fetch(localUri);
-      const blob = await res.blob();
+      const base64 = await new File(localUri).base64();
       const { error: uploadError } = await supabase.storage
         .from("voice-notes")
-        .upload(path, blob, { contentType: "audio/m4a", upsert: false });
+        .upload(path, decode(base64), { contentType: "audio/m4a", upsert: false });
       if (uploadError) {
         throw uploadError;
       }
