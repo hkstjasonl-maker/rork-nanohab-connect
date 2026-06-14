@@ -38,7 +38,7 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
 
-app = FastAPI(title="NanoHab Connect API", version="0.4.0")
+app = FastAPI(title="NanoHab Connect API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,6 +197,44 @@ def rtc_token(room_id: str, authorization: str = Header(default="")):
     }
 
 
+class FakeTranscriber:
+    """Stand-in engine: canned transcript, no provider/key/cost."""
+    name = "fake_v0"
+    def transcribe(self, audio: bytes, language: str):
+        return (f"[fake transcript - {language}]", 5)
+
+
+def get_transcriber(language: str):
+    """Routing seam for 'both engines': choose engine per language. For now one
+    fake engine; later self-hosted Cantonese for 'yue', Azure zh-HK for others."""
+    return FakeTranscriber()
+
+
+@app.post("/drain")
+def drain(x_operator_key: str = Header(default=""), limit: int = 10):
+    """Drain the transcription queue within the DB-enforced concurrency cap.
+    Claims due jobs, transcribes via the pluggable engine, completes or fails
+    each. A failed transcription never loses the recording. Operator-gated."""
+    require_operator(x_operator_key)
+    client = get_service_client()
+    claimed = (client.rpc("claim_transcription_jobs", {"p_limit": limit}).execute().data) or []
+    summary = {"claimed": len(claimed), "succeeded": 0, "failed": 0}
+    for job in claimed:
+        job_id = job["job_id"]
+        artifact_id = job["artifact_id"]
+        try:
+            language = "yue"
+            engine = get_transcriber(language)
+            text, seconds = engine.transcribe(b"", language)
+            client.rpc("set_transcript", {"p_artifact_id": artifact_id, "p_transcript": text, "p_engine": engine.name}).execute()
+            client.rpc("complete_transcription_job", {"p_job_id": job_id, "p_seconds": seconds}).execute()
+            summary["succeeded"] += 1
+        except Exception as e:
+            client.rpc("fail_transcription_job", {"p_job_id": job_id, "p_error": str(e)[:500]}).execute()
+            summary["failed"] += 1
+    return summary
+
+
 @app.get("/ops/orgs")
 def ops_orgs(x_operator_key: str = Header(default="")):
     """OPERATOR stub: cross-org summary, gated by the operator key."""
@@ -215,3 +253,4 @@ def ops_orgs(x_operator_key: str = Header(default="")):
         for o in orgs
     ]
     return {"org_count": len(summary), "orgs": summary}
+
