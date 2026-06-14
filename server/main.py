@@ -61,7 +61,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.10.0")
+app = FastAPI(title="NanoHab Connect API", version="0.11.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -222,6 +222,17 @@ def rtc_token(room_id: str, authorization: str = Header(default="")):
     )
     if not (res.data or []):
         raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # Waiting-room gate (B2b): do not mint a token until the host has admitted.
+    # 'admit' / 'no_session' -> proceed; 'pending' -> 202; 'denied' -> 403.
+    decision = _rpc(client, "svc_admission_for_token", {
+        "p_room_id": room_id,
+        "p_member_id": m["id"],
+    })
+    if decision == "pending":
+        raise HTTPException(status_code=202, detail="Awaiting host admission")
+    if decision == "denied":
+        raise HTTPException(status_code=403, detail="Admission denied")
 
     grants = livekit_api.VideoGrants(
         room_join=True,
@@ -644,6 +655,7 @@ def rtc_start(
     room_id: str,
     recording: bool = False,
     ai_minutes: bool = False,
+    waiting_room: bool = False,
     authorization: str = Header(default=""),
 ):
     """
@@ -658,6 +670,7 @@ def rtc_start(
         "p_member_id": m["id"],
         "p_recording": recording,
         "p_ai_minutes": ai_minutes,
+        "p_waiting_room": waiting_room,
     })
     return {"session": data}
 
@@ -699,3 +712,116 @@ def rtc_consent(
         "p_text_version": (text_version or None),
     })
     return {"consent": data}
+
+
+# ============================================================================
+# Stage B - Slice 2b: waiting-room admit (token-layer gate). Joiners request
+# admission; the host admits/denies; /rtc/token (above) refuses to mint until
+# admitted. All authorization lives in the svc_* RPCs.
+# ============================================================================
+@app.post("/rtc/join-request")
+def rtc_join_request(session_id: str, authorization: str = Header(default="")):
+    """
+    Ask to join a live session. Host/starter is admitted immediately; everyone
+    else lands 'pending'. Idempotent - re-call to poll the current status.
+    Returns {"status": "admitted" | "pending" | "denied"}.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_request_admission", {
+        "p_session_id": session_id,
+        "p_member_id": m["id"],
+    })
+    status = data.get("status") if isinstance(data, dict) else None
+    return {"status": status}
+
+
+@app.get("/rtc/admissions")
+def rtc_admissions(session_id: str, authorization: str = Header(default="")):
+    """
+    The host's knocking list: pending requests for a session, with names
+    resolved server-side (so cross-org names still show). Host/starter only.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    sess = (
+        client.table("live_sessions")
+        .select("room_id, started_by")
+        .eq("id", session_id)
+        .limit(1)
+        .execute()
+        .data
+    ) or []
+    if not sess:
+        raise HTTPException(status_code=404, detail="No such session")
+    room_id = sess[0]["room_id"]
+    started_by = sess[0]["started_by"]
+
+    is_host = (
+        client.table("room_members")
+        .select("id")
+        .eq("room_id", room_id)
+        .eq("member_id", m["id"])
+        .eq("member_role", "host")
+        .limit(1)
+        .execute()
+        .data
+    ) or []
+    if not is_host and started_by != m["id"]:
+        raise HTTPException(status_code=403, detail="Only the host can view admissions")
+
+    pending = (
+        client.table("admissions")
+        .select("member_id, requested_at")
+        .eq("live_session_id", session_id)
+        .eq("status", "pending")
+        .order("requested_at")
+        .execute()
+        .data
+    ) or []
+
+    out = []
+    for a in pending:
+        mem = (
+            client.table("members")
+            .select("full_name")
+            .eq("id", a["member_id"])
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+        out.append({
+            "member_id": a["member_id"],
+            "full_name": (mem[0]["full_name"] if mem else "Unknown"),
+            "requested_at": a["requested_at"],
+        })
+    return {"pending": out}
+
+
+@app.post("/rtc/admit")
+def rtc_admit(session_id: str, member_id: str, authorization: str = Header(default="")):
+    """Host/starter admits a pending member."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_decide_admission", {
+        "p_session_id": session_id,
+        "p_target_member_id": member_id,
+        "p_decider_id": m["id"],
+        "p_admit": True,
+    })
+    return {"admission": data}
+
+
+@app.post("/rtc/deny")
+def rtc_deny(session_id: str, member_id: str, authorization: str = Header(default="")):
+    """Host/starter denies a pending member."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_decide_admission", {
+        "p_session_id": session_id,
+        "p_target_member_id": member_id,
+        "p_decider_id": m["id"],
+        "p_admit": False,
+    })
+    return {"admission": data}
