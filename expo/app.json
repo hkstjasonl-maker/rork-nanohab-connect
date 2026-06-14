@@ -18,6 +18,7 @@
       "bundleIdentifier": "com.dravive.nanohabconnect",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "NanoHab Connect uses your microphone for case calls.",
+        "NSCameraUsageDescription": "NanoHab Connect uses your camera for case calls.",
         "ITSAppUsesNonExemptEncryption": false
       },
       "bitcode": false
