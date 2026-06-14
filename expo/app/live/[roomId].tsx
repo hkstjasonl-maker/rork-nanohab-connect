@@ -4,6 +4,7 @@ import {
   VideoTrack,
   isTrackReference,
   useConnectionState,
+  useDataChannel,
   useLocalParticipant,
   useParticipants,
   useTracks,
@@ -15,29 +16,40 @@ import {
   type Participant,
 } from "livekit-client";
 import {
+  BarChart3,
+  Hand,
+  MessageSquare,
   Mic,
   MicOff,
   PhoneOff,
+  Plus,
+  Send,
   Video,
   VideoOff,
   Volume2,
+  X,
   XOctagon,
 } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
   Pressable,
   ScrollView,
   StatusBar,
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Theme } from "@/constants/colors";
+import { getCurrentMemberId } from "@/lib/member";
 import { supabase } from "@/lib/supabase";
 
 type TokenResponse = {
@@ -67,6 +79,38 @@ type PendingPerson = {
 };
 
 type JoinStatus = "admitted" | "pending" | "denied";
+
+type HandPayload = {
+  t: string;
+  raised: boolean;
+  identity: string;
+  name?: string;
+};
+
+type ChatRow = {
+  id: string;
+  body: string | null;
+  kind: string;
+  created_at: string;
+  author_member_id: string | null;
+  author: { full_name: string | null } | null;
+};
+
+type PollRow = {
+  id: string;
+  question: string;
+  options: string[];
+  status: string;
+  created_by: string;
+};
+
+type PollVote = {
+  option_index: number;
+  member_id: string;
+};
+
+const CHAT_SELECT =
+  "id, body, kind, created_at, author_member_id, author:members!author_member_id(full_name)";
 
 type Stage =
   | { kind: "prejoin" }
@@ -680,6 +724,62 @@ function CallContents({
   const canEnd = tokenIdentity === session.started_by;
   const [pending, setPending] = useState<PendingPerson[]>([]);
 
+  const localIdentity = localParticipant.identity;
+  const [raisedHands, setRaisedHands] = useState<Set<string>>(new Set());
+  const [chatOpen, setChatOpen] = useState<boolean>(false);
+  const [pollOpen, setPollOpen] = useState<boolean>(false);
+
+  const onHandMessage = useCallback(
+    (msg: { payload: Uint8Array }) => {
+      try {
+        const text = new TextDecoder().decode(msg.payload);
+        const payload = JSON.parse(text) as HandPayload;
+        if (payload.t !== "hand" || !payload.identity) {
+          return;
+        }
+        setRaisedHands((prev) => {
+          const next = new Set(prev);
+          if (payload.raised) {
+            next.add(payload.identity);
+          } else {
+            next.delete(payload.identity);
+          }
+          return next;
+        });
+      } catch (e) {
+        console.error("Hand message parse failed:", e);
+      }
+    },
+    [],
+  );
+
+  const { send: sendHand } = useDataChannel("hand", onHandMessage);
+
+  const handRaised = raisedHands.has(localIdentity);
+
+  const toggleHand = useCallback(() => {
+    const next = !raisedHands.has(localIdentity);
+    setRaisedHands((prev) => {
+      const s = new Set(prev);
+      if (next) {
+        s.add(localIdentity);
+      } else {
+        s.delete(localIdentity);
+      }
+      return s;
+    });
+    const payload: HandPayload = {
+      t: "hand",
+      raised: next,
+      identity: localIdentity,
+      name: localParticipant.name ?? undefined,
+    };
+    const data = new TextEncoder().encode(JSON.stringify(payload));
+    sendHand(data, { reliable: true, topic: "hand" }).catch((e: unknown) => {
+      console.error("Publish hand failed:", e);
+    });
+  }, [raisedHands, localIdentity, localParticipant.name, sendHand]);
+
   useEffect(() => {
     if (!canEnd) {
       return;
@@ -763,6 +863,7 @@ function CallContents({
         participant={p}
         trackRef={trackRef}
         fullWidth={oneColumn}
+        raised={raisedHands.has(p.identity)}
       />
     );
   });
@@ -830,7 +931,37 @@ function CallContents({
 
       {grid}
 
-      <View style={[styles.controls, { paddingBottom: insets.bottom + 24 }]}>
+      <View style={{ paddingBottom: insets.bottom + 24 }}>
+        <View style={styles.secondaryControls}>
+          <Pressable
+            style={[styles.secCtrl, handRaised && styles.secCtrlActive]}
+            onPress={toggleHand}
+            testID="hand-toggle"
+          >
+            <Hand color={Theme.surface} size={20} />
+            <Text style={styles.secCtrlLabel}>
+              {raisedHands.size > 0 ? `Hands (${raisedHands.size})` : "Raise hand"}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={styles.secCtrl}
+            onPress={() => setChatOpen(true)}
+            testID="chat-open"
+          >
+            <MessageSquare color={Theme.surface} size={20} />
+            <Text style={styles.secCtrlLabel}>Chat</Text>
+          </Pressable>
+          <Pressable
+            style={styles.secCtrl}
+            onPress={() => setPollOpen(true)}
+            testID="poll-open"
+          >
+            <BarChart3 color={Theme.surface} size={20} />
+            <Text style={styles.secCtrlLabel}>Poll</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.controls}>
         <Pressable
           style={[styles.ctrlButton, !isMicrophoneEnabled && styles.ctrlOff]}
           onPress={toggleMic}
@@ -878,7 +1009,37 @@ function CallContents({
           <PhoneOff color="#FFFFFF" size={26} />
           <Text style={styles.leaveLabel}>Leave</Text>
         </Pressable>
+        </View>
       </View>
+
+      <Modal
+        visible={chatOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setChatOpen(false)}
+      >
+        {chatOpen ? (
+          <ChatPanel
+            roomId={session.room_id}
+            onClose={() => setChatOpen(false)}
+          />
+        ) : null}
+      </Modal>
+
+      <Modal
+        visible={pollOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setPollOpen(false)}
+      >
+        {pollOpen ? (
+          <PollPanel
+            sessionId={session.id}
+            isStarter={canEnd}
+            onClose={() => setPollOpen(false)}
+          />
+        ) : null}
+      </Modal>
     </View>
   );
 }
@@ -887,10 +1048,12 @@ function ParticipantTile({
   participant,
   trackRef,
   fullWidth,
+  raised,
 }: {
   participant: Participant;
   trackRef: React.ComponentProps<typeof VideoTrack>["trackRef"];
   fullWidth: boolean;
+  raised: boolean;
 }) {
   const label =
     participant.name && participant.name.length > 0
@@ -924,12 +1087,465 @@ function ParticipantTile({
         </View>
       )}
 
+      {raised ? (
+        <View style={styles.handBadge}>
+          <Hand color="#0C1512" size={16} />
+        </View>
+      ) : null}
+
       <View style={styles.tileFooter}>
         {micOff ? <MicOff color="#FFFFFF" size={14} /> : null}
         {participant.isSpeaking ? (
           <Text style={styles.speakingLabel}>Speaking</Text>
         ) : null}
       </View>
+    </View>
+  );
+}
+
+function ChatPanel({
+  roomId,
+  onClose,
+}: {
+  roomId: string;
+  onClose: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const [messages, setMessages] = useState<ChatRow[]>([]);
+  const [text, setText] = useState<string>("");
+  const [memberId, setMemberId] = useState<string | null>(null);
+  const [sending, setSending] = useState<boolean>(false);
+
+  useEffect(() => {
+    getCurrentMemberId()
+      .then(setMemberId)
+      .catch(() => {});
+  }, []);
+
+  const loadMessages = useCallback(async (): Promise<ChatRow[]> => {
+    const { data, error } = await supabase
+      .from("messages")
+      .select(CHAT_SELECT)
+      .eq("room_id", roomId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      throw error;
+    }
+    return (data ?? []) as unknown as ChatRow[];
+  }, [roomId]);
+
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const rows = await loadMessages();
+        if (active) {
+          setMessages(rows);
+        }
+      } catch (e) {
+        console.error("Chat load failed:", e);
+      }
+      if (active) {
+        timer = setTimeout(poll, 2000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [loadMessages]);
+
+  const onSend = useCallback(async () => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0 || sending) {
+      return;
+    }
+    setSending(true);
+    try {
+      const id = memberId ?? (await getCurrentMemberId());
+      if (!id) {
+        throw new Error("Could not resolve your member id.");
+      }
+      const { error } = await supabase.from("messages").insert({
+        room_id: roomId,
+        author_member_id: id,
+        body: trimmed,
+        kind: "text",
+      });
+      if (error) {
+        throw error;
+      }
+      setText("");
+      const rows = await loadMessages();
+      setMessages(rows);
+    } catch (e) {
+      console.error("Chat send failed:", e);
+    } finally {
+      setSending(false);
+    }
+  }, [text, sending, memberId, roomId, loadMessages]);
+
+  return (
+    <View style={styles.sheetOverlay}>
+      <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={[styles.sheet, { paddingBottom: insets.bottom + 12 }]}
+      >
+        <View style={styles.sheetHandle} />
+        <View style={styles.sheetHead}>
+          <Text style={styles.sheetTitle}>Chat</Text>
+          <Pressable onPress={onClose} hitSlop={12}>
+            <X color="#C7D0CB" size={22} />
+          </Pressable>
+        </View>
+        <ScrollView
+          style={styles.chatScroll}
+          contentContainerStyle={styles.chatContent}
+          showsVerticalScrollIndicator={false}
+        >
+          {messages.length === 0 ? (
+            <Text style={styles.sheetMuted}>No messages yet.</Text>
+          ) : (
+            messages.map((m) => {
+              const mine = memberId != null && m.author_member_id === memberId;
+              return (
+                <View
+                  key={m.id}
+                  style={[
+                    styles.chatBubble,
+                    mine ? styles.chatMine : styles.chatTheirs,
+                  ]}
+                >
+                  <Text style={styles.chatAuthor}>
+                    {mine ? "You" : m.author?.full_name ?? "Unknown"}
+                  </Text>
+                  <Text style={styles.chatBody}>{m.body}</Text>
+                </View>
+              );
+            })
+          )}
+        </ScrollView>
+        <View style={styles.chatComposer}>
+          <TextInput
+            style={styles.chatInput}
+            value={text}
+            onChangeText={setText}
+            placeholder="Message"
+            placeholderTextColor="#7E8B85"
+            multiline
+            testID="chat-input"
+          />
+          <Pressable
+            style={[
+              styles.chatSend,
+              (text.trim().length === 0 || sending) && styles.disabledBtn,
+            ]}
+            onPress={onSend}
+            disabled={text.trim().length === 0 || sending}
+            testID="chat-send"
+          >
+            {sending ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <Send color="#FFFFFF" size={20} />
+            )}
+          </Pressable>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
+function PollPanel({
+  sessionId,
+  isStarter,
+  onClose,
+}: {
+  sessionId: string;
+  isStarter: boolean;
+  onClose: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const [poll, setPoll] = useState<PollRow | null>(null);
+  const [votes, setVotes] = useState<PollVote[]>([]);
+  const [memberId, setMemberId] = useState<string | null>(null);
+  const [question, setQuestion] = useState<string>("");
+  const [options, setOptions] = useState<string[]>(["", ""]);
+  const [busy, setBusy] = useState<boolean>(false);
+  const [closedView, setClosedView] = useState<{
+    poll: PollRow;
+    votes: PollVote[];
+  } | null>(null);
+
+  useEffect(() => {
+    getCurrentMemberId()
+      .then(setMemberId)
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (closedView) {
+      return;
+    }
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const { data, error } = await supabase
+          .from("polls")
+          .select("id, question, options, status, created_by")
+          .eq("live_session_id", sessionId)
+          .eq("status", "open")
+          .order("created_at", { ascending: false })
+          .limit(1);
+        if (error) {
+          throw error;
+        }
+        const current =
+          data && data.length > 0 ? (data[0] as PollRow) : null;
+        if (active) {
+          setPoll(current);
+        }
+        if (current) {
+          const v = await supabase
+            .from("poll_votes")
+            .select("option_index, member_id")
+            .eq("poll_id", current.id);
+          if (active && !v.error) {
+            setVotes((v.data ?? []) as PollVote[]);
+          }
+        } else if (active) {
+          setVotes([]);
+        }
+      } catch (e) {
+        console.error("Poll load failed:", e);
+      }
+      if (active) {
+        timer = setTimeout(poll, 2000);
+      }
+    };
+    poll();
+    return () => {
+      active = false;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [sessionId, closedView]);
+
+  const submitCreate = useCallback(async () => {
+    const q = question.trim();
+    const opts = options.map((o) => o.trim()).filter(Boolean);
+    if (q.length === 0 || opts.length < 2 || busy) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const { error } = await supabase.rpc("create_poll", {
+        p_session_id: sessionId,
+        p_question: q,
+        p_options: opts,
+      });
+      if (error) {
+        throw error;
+      }
+      setQuestion("");
+      setOptions(["", ""]);
+    } catch (e) {
+      console.error("Create poll failed:", e);
+      Alert.alert("Couldn't create poll", "Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  }, [question, options, busy, sessionId]);
+
+  const castVote = useCallback(
+    async (index: number) => {
+      if (!poll || busy) {
+        return;
+      }
+      setBusy(true);
+      try {
+        const { error } = await supabase.rpc("vote_poll", {
+          p_poll_id: poll.id,
+          p_option_index: index,
+        });
+        if (error) {
+          throw error;
+        }
+        const v = await supabase
+          .from("poll_votes")
+          .select("option_index, member_id")
+          .eq("poll_id", poll.id);
+        if (!v.error) {
+          setVotes((v.data ?? []) as PollVote[]);
+        }
+      } catch (e) {
+        console.error("Vote failed:", e);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [poll, busy],
+  );
+
+  const closeCurrent = useCallback(async () => {
+    if (!poll || busy) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const { error } = await supabase.rpc("close_poll", {
+        p_poll_id: poll.id,
+      });
+      if (error) {
+        throw error;
+      }
+      setClosedView({ poll, votes });
+    } catch (e) {
+      console.error("Close poll failed:", e);
+    } finally {
+      setBusy(false);
+    }
+  }, [poll, votes, busy]);
+
+  const addOption = useCallback(() => {
+    setOptions((o) => (o.length < 4 ? [...o, ""] : o));
+  }, []);
+
+  const view = closedView ?? (poll ? { poll, votes } : null);
+  const readOnly = closedView != null;
+  const myVote =
+    view && memberId != null
+      ? view.votes.find((v) => v.member_id === memberId)?.option_index
+      : undefined;
+  const total = view ? view.votes.length : 0;
+  const canClose =
+    view != null &&
+    !readOnly &&
+    (isStarter || (memberId != null && view.poll.created_by === memberId));
+
+  return (
+    <View style={styles.sheetOverlay}>
+      <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={[styles.sheet, { paddingBottom: insets.bottom + 12 }]}
+      >
+        <View style={styles.sheetHandle} />
+        <View style={styles.sheetHead}>
+          <Text style={styles.sheetTitle}>Poll</Text>
+          <Pressable onPress={onClose} hitSlop={12}>
+            <X color="#C7D0CB" size={22} />
+          </Pressable>
+        </View>
+
+        <ScrollView
+          contentContainerStyle={styles.pollContent}
+          showsVerticalScrollIndicator={false}
+        >
+          {view ? (
+            <View style={styles.pollWrap}>
+              {readOnly ? (
+                <Text style={styles.sheetMuted}>This poll is closed.</Text>
+              ) : null}
+              <Text style={styles.pollQuestion}>{view.poll.question}</Text>
+              {view.poll.options.map((opt, i) => {
+                const count = view.votes.filter(
+                  (v) => v.option_index === i,
+                ).length;
+                const ratio = total > 0 ? count / total : 0;
+                const selected = myVote === i;
+                return (
+                  <Pressable
+                    key={`${view.poll.id}-${i}`}
+                    style={[
+                      styles.pollOption,
+                      selected && styles.pollOptionSelected,
+                    ]}
+                    onPress={() => castVote(i)}
+                    disabled={readOnly || busy}
+                    testID={`poll-option-${i}`}
+                  >
+                    <View
+                      style={[
+                        styles.pollBar,
+                        { width: `${Math.round(ratio * 100)}%` },
+                      ]}
+                    />
+                    <View style={styles.pollOptionRow}>
+                      <Text style={styles.pollOptionLabel} numberOfLines={2}>
+                        {opt}
+                      </Text>
+                      <Text style={styles.pollCount}>{count}</Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
+              {canClose ? (
+                <Pressable
+                  style={styles.pollCloseBtn}
+                  onPress={closeCurrent}
+                  disabled={busy}
+                  testID="poll-close"
+                >
+                  <Text style={styles.pollCloseText}>Close poll</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          ) : (
+            <View style={styles.pollWrap}>
+              <Text style={styles.sheetMuted}>No active poll.</Text>
+              <TextInput
+                style={styles.pollInput}
+                value={question}
+                onChangeText={setQuestion}
+                placeholder="Ask a question"
+                placeholderTextColor="#7E8B85"
+                testID="poll-question"
+              />
+              {options.map((opt, i) => (
+                <TextInput
+                  key={`opt-${i}`}
+                  style={styles.pollInput}
+                  value={opt}
+                  onChangeText={(t) =>
+                    setOptions((prev) =>
+                      prev.map((o, idx) => (idx === i ? t : o)),
+                    )
+                  }
+                  placeholder={`Option ${i + 1}`}
+                  placeholderTextColor="#7E8B85"
+                  testID={`poll-create-option-${i}`}
+                />
+              ))}
+              {options.length < 4 ? (
+                <Pressable
+                  style={styles.pollAddOption}
+                  onPress={addOption}
+                  testID="poll-add-option"
+                >
+                  <Plus color={Theme.primary} size={18} />
+                  <Text style={styles.pollAddText}>Add option</Text>
+                </Pressable>
+              ) : null}
+              <Pressable
+                style={[styles.pollSubmit, busy && styles.disabledBtn]}
+                onPress={submitCreate}
+                disabled={busy}
+                testID="poll-create-submit"
+              >
+                <Text style={styles.pollSubmitText}>Create poll</Text>
+              </Pressable>
+            </View>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }
@@ -1099,6 +1715,37 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   speakingLabel: { color: Theme.coral, fontSize: 13, fontWeight: "600" },
+  handBadge: {
+    position: "absolute",
+    top: 10,
+    right: 10,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: "#F2C94C",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  secondaryControls: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 10,
+    paddingTop: 8,
+    paddingHorizontal: 16,
+  },
+  secCtrl: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "rgba(255,255,255,0.10)",
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+  },
+  secCtrlActive: { backgroundColor: Theme.primary },
+  secCtrlLabel: { color: Theme.surface, fontSize: 13, fontWeight: "600" },
   controls: {
     flexDirection: "row",
     alignItems: "center",
@@ -1138,4 +1785,138 @@ const styles = StyleSheet.create({
     borderRadius: 22,
   },
   leaveLabel: { color: "#FFFFFF", fontSize: 13, fontWeight: "600" },
+  disabledBtn: { opacity: 0.4 },
+  sheetOverlay: { flex: 1, justifyContent: "flex-end" },
+  sheetBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.5)",
+  },
+  sheet: {
+    maxHeight: "80%",
+    backgroundColor: "#15211C",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+  },
+  sheetHandle: {
+    alignSelf: "center",
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "rgba(255,255,255,0.25)",
+    marginBottom: 12,
+  },
+  sheetHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  sheetTitle: { color: "#FFFFFF", fontSize: 20, fontWeight: "700" },
+  sheetMuted: { color: "#AEB8B3", fontSize: 14 },
+  chatScroll: { maxHeight: 360 },
+  chatContent: { gap: 10, paddingBottom: 12 },
+  chatBubble: {
+    maxWidth: "85%",
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 2,
+  },
+  chatMine: {
+    alignSelf: "flex-end",
+    backgroundColor: "rgba(15,110,86,0.45)",
+  },
+  chatTheirs: {
+    alignSelf: "flex-start",
+    backgroundColor: "rgba(255,255,255,0.08)",
+  },
+  chatAuthor: { color: "#AEB8B3", fontSize: 12, fontWeight: "600" },
+  chatBody: { color: "#FFFFFF", fontSize: 15, lineHeight: 21 },
+  chatComposer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 10,
+    paddingTop: 10,
+  },
+  chatInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 110,
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 12,
+    fontSize: 15,
+    color: "#FFFFFF",
+    backgroundColor: "rgba(255,255,255,0.08)",
+  },
+  chatSend: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: Theme.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pollContent: { paddingBottom: 16 },
+  pollWrap: { gap: 12 },
+  pollQuestion: { color: "#FFFFFF", fontSize: 17, fontWeight: "700" },
+  pollOption: {
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 2,
+    borderColor: "transparent",
+    overflow: "hidden",
+    minHeight: 48,
+    justifyContent: "center",
+  },
+  pollOptionSelected: { borderColor: Theme.primary },
+  pollBar: {
+    ...StyleSheet.absoluteFillObject,
+    right: undefined,
+    backgroundColor: "rgba(15,110,86,0.4)",
+  },
+  pollOptionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 12,
+  },
+  pollOptionLabel: { flex: 1, color: "#FFFFFF", fontSize: 15, fontWeight: "600" },
+  pollCount: { color: "#C7D0CB", fontSize: 14, fontWeight: "700" },
+  pollCloseBtn: {
+    marginTop: 4,
+    alignItems: "center",
+    paddingVertical: 12,
+    borderRadius: 22,
+    backgroundColor: "rgba(255,255,255,0.10)",
+  },
+  pollCloseText: { color: Theme.coral, fontSize: 15, fontWeight: "700" },
+  pollInput: {
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
+    color: "#FFFFFF",
+    backgroundColor: "rgba(255,255,255,0.08)",
+  },
+  pollAddOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 6,
+  },
+  pollAddText: { color: Theme.primary, fontSize: 14, fontWeight: "600" },
+  pollSubmit: {
+    marginTop: 4,
+    alignItems: "center",
+    paddingVertical: 14,
+    borderRadius: 22,
+    backgroundColor: Theme.primary,
+  },
+  pollSubmitText: { color: "#FFFFFF", fontSize: 16, fontWeight: "700" },
 });
