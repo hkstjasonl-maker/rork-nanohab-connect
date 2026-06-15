@@ -88,7 +88,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.17.0")
+app = FastAPI(title="NanoHab Connect API", version="0.18.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -497,7 +497,82 @@ def drain(x_operator_key: str = Header(default=""), limit: int = 10):
             client.rpc("fail_transcription_job", {"p_job_id": jid, "p_error": str(e)[:500]}).execute()
             s["failed"] += 1
 
+    # Phase 3 — B4b.2: drive ONE auto-minutes job (reconcile->transcribe->minutes).
+    # Reuses this every-minute scheduler tick; no separate cron needed. One job per
+    # call keeps the request well under Cloud Run's request timeout.
+    try:
+        s["minutes"] = _process_one_minutes_job(client) or "idle"
+    except Exception as e:  # noqa: BLE001 — minutes must never break the drain
+        s["minutes"] = "error"
+        print(f"[drain] minutes phase error: {e}")
+
     return s
+
+
+def _process_one_minutes_job(client):
+    """
+    Claim and run ONE auto-minutes job end to end: reconcile (per_track) ->
+    transcribe -> minutes, using the recording's started_by as the acting member
+    (a consented room member, so every membership/gate check passes). The cores
+    are idempotent, so a reclaim after a crash just repeats safely.
+    Returns 'done' | 'retry' | 'failed' | None (nothing queued).
+    """
+    job = _rpc_quiet(client, "svc_claim_minutes_job",
+                     {"p_max_attempts": 5, "p_stale_minutes": 3})
+    rec = job[0] if isinstance(job, list) and job else (job if isinstance(job, dict) else None)
+    if not rec or not rec.get("id"):
+        return None
+    rid = rec["id"]
+    member_id = rec.get("started_by")
+    if not member_id:
+        _rpc_quiet(client, "svc_finish_minutes_job",
+                   {"p_recording_id": rid, "p_status": "failed", "p_error": "no started_by"})
+        return "failed"
+    try:
+        if (rec.get("recording_mode") or "composite") == "per_track":
+            recon = _reconcile_recording_core(client, rid, member_id)
+            if (recon.get("tracks_found") or 0) == 0:
+                # Track files not finalized yet (or a silent recording) -> retry next tick.
+                _rpc_quiet(client, "svc_finish_minutes_job",
+                           {"p_recording_id": rid, "p_status": "pending",
+                            "p_error": "no track files yet"})
+                return "retry"
+        _transcribe_recording_core(client, rid, member_id)          # idempotent
+        _minutes_recording_core(client, rid, member_id, "tight")    # conservative default
+        _rpc_quiet(client, "svc_finish_minutes_job",
+                   {"p_recording_id": rid, "p_status": "done", "p_error": None})
+        print(f"[minutes] auto-minutes done for recording {rid}")
+        return "done"
+    except Exception as e:  # noqa: BLE001
+        _rpc_quiet(client, "svc_finish_minutes_job",
+                   {"p_recording_id": rid, "p_status": "failed", "p_error": str(e)[:500]})
+        print(f"[minutes] auto-minutes failed for recording {rid}: {e}")
+        return "failed"
+
+
+def _maybe_enqueue_minutes(client, session_id: str, session_row) -> None:
+    """
+    Best-effort: when a session recorded WITH ai-minutes consent ends, queue
+    auto-minutes for its (completed) recording. Never raises — must not break
+    /rtc/end. Sessions without ai_minutes consent are intentionally skipped (the
+    host-only transcribe-later gate handles those).
+    """
+    try:
+        row = session_row[0] if isinstance(session_row, list) and session_row else session_row
+        if not isinstance(row, dict):
+            return
+        if not (row.get("recording_enabled") and row.get("ai_minutes_enabled")):
+            return
+        recs = (client.table("meeting_recordings")
+                .select("id, status")
+                .eq("live_session_id", session_id)
+                .order("created_at", desc=True).limit(1).execute().data) or []
+        if not recs or recs[0].get("status") != "completed":
+            return
+        _rpc_quiet(client, "svc_enqueue_minutes", {"p_recording_id": recs[0]["id"]})
+        print(f"[minutes] enqueued auto-minutes for recording {recs[0]['id']}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[minutes] enqueue skipped: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -1030,6 +1105,7 @@ def rtc_end(session_id: str, authorization: str = Header(default="")):
         "p_member_id": m["id"],
     })
     rec_status = _maybe_stop_recording(client, session_id)
+    _maybe_enqueue_minutes(client, session_id, data)
     return {"session": data, "recording": rec_status}
 
 
@@ -1044,9 +1120,15 @@ def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default=
     Call AFTER /rtc/end and a short wait (track files finalize asynchronously).
     Re-runnable. Seeds B4b' per-track transcription.
     """
-    m = resolve_member(authorization)
-    client = get_service_client()
+    return _reconcile_recording_core(
+        get_service_client(), recording_id, resolve_member(authorization)["id"])
 
+
+def _reconcile_recording_core(client, recording_id: str, member_id: str) -> dict:
+    """
+    Shared reconcile core (HTTP endpoint + B4b.2 minutes auto-trigger worker).
+    member_id must be a room member; the worker passes the recording's started_by.
+    """
     rows = (client.table("meeting_recordings")
             .select("id, live_session_id, room_id, recording_mode, storage_bucket")
             .eq("id", recording_id).limit(1).execute().data) or []
@@ -1054,7 +1136,7 @@ def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default=
         raise HTTPException(status_code=404, detail="No such recording")
     rec = rows[0]
     if not (client.table("room_members").select("id")
-            .eq("room_id", rec["room_id"]).eq("member_id", m["id"]).limit(1).execute().data or []):
+            .eq("room_id", rec["room_id"]).eq("member_id", member_id).limit(1).execute().data or []):
         raise HTTPException(status_code=403, detail="Not a member of this room")
     if (rec.get("recording_mode") or "composite") != "per_track":
         raise HTTPException(status_code=400, detail="Not a per_track recording")
@@ -1067,7 +1149,7 @@ def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default=
         found += 1
         row = _rpc_quiet(client, "svc_record_track", {
             "p_recording_id": recording_id,
-            "p_member_id": m["id"],
+            "p_member_id": member_id,
             "p_participant_identity": fobj["identity"],
             "p_egress_id": fobj["egress_id"],
             "p_track_id": fobj["track_id"],
@@ -1429,13 +1511,19 @@ def rtc_transcribe(recording_id: str, authorization: str = Header(default="")):
     short). On any engine error the transcript row is marked 'failed' (never left
     dangling) and a 502 is returned.
     """
-    m = resolve_member(authorization)
-    client = get_service_client()
+    return _transcribe_recording_core(
+        get_service_client(), recording_id, resolve_member(authorization)["id"])
 
+
+def _transcribe_recording_core(client, recording_id: str, member_id: str) -> dict:
+    """
+    Shared transcribe core (HTTP endpoint + B4b.2 minutes auto-trigger worker).
+    member_id must be a room member; the worker passes the recording's started_by.
+    """
     # Create/return the transcript row (authorization + gating live in the RPC).
     tr = _rpc(client, "svc_start_meeting_transcript", {
         "p_recording_id": recording_id,
-        "p_member_id": m["id"],
+        "p_member_id": member_id,
     })
     if not isinstance(tr, dict) or not tr.get("id"):
         raise HTTPException(status_code=500, detail="Could not start transcript")
@@ -1655,16 +1743,23 @@ def rtc_minutes(recording_id: str, style: str = "tight", authorization: str = He
     """
     if style not in ("tight", "detailed"):
         raise HTTPException(status_code=400, detail="style must be 'tight' or 'detailed'")
-    m = resolve_member(authorization)
-    client = get_service_client()
+    return _minutes_recording_core(
+        get_service_client(), recording_id, resolve_member(authorization)["id"], style)
 
+
+def _minutes_recording_core(client, recording_id: str, member_id: str, style: str) -> dict:
+    """
+    Shared minutes-generation core (HTTP endpoint + B4b.2 auto-trigger worker).
+    member_id must be a room member; the worker passes the recording's started_by.
+    Assumes style already validated ('tight' | 'detailed').
+    """
     tr = _completed_transcript_for(client, recording_id)
     if not tr:
         raise HTTPException(status_code=409, detail="No completed transcript for this recording (run /rtc/transcribe first)")
     transcript_id = tr["id"]
 
     art = _rpc(client, "svc_create_minutes_artifact", {
-        "p_transcript_id": transcript_id, "p_member_id": m["id"]})
+        "p_transcript_id": transcript_id, "p_member_id": member_id})
     if not isinstance(art, dict) or not art.get("id"):
         raise HTTPException(status_code=500, detail="Could not create minutes artifact")
     artifact_id = art["id"]
@@ -1690,15 +1785,15 @@ def rtc_minutes(recording_id: str, style: str = "tight", authorization: str = He
                          for i, s in enumerate(result.get("suggested_action_items") or []) if (s.get("text") or "").strip()]
 
         _rpc(client, "svc_set_minutes_draft", {
-            "p_artifact_id": artifact_id, "p_member_id": m["id"],
+            "p_artifact_id": artifact_id, "p_member_id": member_id,
             "p_draft": minutes_text, "p_engine_version": engine.name})
         _rpc_quiet(client, "svc_write_meeting_extractions", {
             "p_transcript_id": transcript_id, "p_minutes_artifact_id": artifact_id,
-            "p_member_id": m["id"], "p_decisions": decisions, "p_action_items": actions})
+            "p_member_id": member_id, "p_decisions": decisions, "p_action_items": actions})
         if suggested:
             _rpc_quiet(client, "svc_write_suggested_action_items", {
                 "p_transcript_id": transcript_id, "p_minutes_artifact_id": artifact_id,
-                "p_member_id": m["id"], "p_items": suggested})
+                "p_member_id": member_id, "p_items": suggested})
 
         return {
             "minutes_artifact_id": artifact_id, "state": "drafted", "style": style,
