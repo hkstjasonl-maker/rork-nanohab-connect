@@ -25,6 +25,7 @@ Config comes from environment variables (set in Cloud Run, never in code):
   OPERATOR_API_KEY
 """
 
+import asyncio
 import hmac
 import json
 import os
@@ -46,6 +47,29 @@ LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
 
+# LiveKit egress -> object storage (Stage B4a). Composite audio is mixed
+# server-side and written to an S3-compatible bucket; we use Supabase Storage's
+# S3 endpoint so the file lands in the same project/region as everything else
+# and B4b's worker can read it the same way it reads voice notes. Recording only
+# engages if ALL of these (plus LiveKit) are set; otherwise calls run normally,
+# just without server-side recording.
+RECORDINGS_BUCKET = os.environ.get("RECORDINGS_BUCKET", "meeting-recordings")
+SUPABASE_S3_ENDPOINT = os.environ.get("SUPABASE_S3_ENDPOINT", "")
+SUPABASE_S3_REGION = os.environ.get("SUPABASE_S3_REGION", "")
+SUPABASE_S3_ACCESS_KEY = os.environ.get("SUPABASE_S3_ACCESS_KEY", "")
+SUPABASE_S3_SECRET_KEY = os.environ.get("SUPABASE_S3_SECRET_KEY", "")
+
+# The client connects over wss://; the server-side egress (Twirp) API is https://.
+LIVEKIT_HTTP_URL = LIVEKIT_URL.replace("wss://", "https://").replace("ws://", "http://")
+
+
+def _recordings_configured() -> bool:
+    return bool(
+        RECORDINGS_BUCKET and SUPABASE_S3_ENDPOINT and SUPABASE_S3_REGION
+        and SUPABASE_S3_ACCESS_KEY and SUPABASE_S3_SECRET_KEY
+        and LIVEKIT_HTTP_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET
+    )
+
 # Azure AI Speech (transcription). Absent until provisioned -> worker uses fakes.
 AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "")
@@ -61,7 +85,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.11.0")
+app = FastAPI(title="NanoHab Connect API", version="0.12.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -142,6 +166,7 @@ def health():
             LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET
         ),
         "operator_configured": bool(OPERATOR_API_KEY),
+        "recordings_configured": _recordings_configured(),
     }
 
 
@@ -650,6 +675,136 @@ def _rpc(client, fn: str, params: dict):
         raise HTTPException(status_code=500, detail="Live-session operation failed")
 
 
+# ============================================================================
+# Stage B4a — meeting recording via LiveKit room-composite (audio-only) egress.
+# Audio is mixed server-side and written to the recordings bucket over the
+# S3-compatible endpoint. Egress calls are async; these routes are sync, so we
+# drive them with asyncio.run (FastAPI runs sync routes in a worker thread, so
+# there is no already-running loop to clash with). Recording is BEST-EFFORT:
+# every failure is logged and swallowed so a live call is never broken by a
+# recording problem.
+# ============================================================================
+def _rpc_quiet(client, fn: str, params: dict):
+    """Like _rpc, but never raises HTTP — for best-effort recording writes."""
+    try:
+        return client.rpc(fn, params).execute().data
+    except Exception as e:
+        print(f"[rec] rpc {fn} failed: {e}")
+        return None
+
+
+def _lk_api():
+    return livekit_api.LiveKitAPI(LIVEKIT_HTTP_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+
+
+def _start_audio_egress(room_name: str, object_key: str) -> str:
+    """Start a room-composite audio-only egress to the recordings bucket;
+    return the LiveKit egress id."""
+    async def _run() -> str:
+        lk = _lk_api()
+        try:
+            req = livekit_api.RoomCompositeEgressRequest(
+                room_name=room_name,
+                audio_only=True,
+                file_outputs=[livekit_api.EncodedFileOutput(
+                    file_type=livekit_api.EncodedFileType.OGG,
+                    filepath=object_key,
+                    s3=livekit_api.S3Upload(
+                        bucket=RECORDINGS_BUCKET,
+                        region=SUPABASE_S3_REGION,
+                        access_key=SUPABASE_S3_ACCESS_KEY,
+                        secret=SUPABASE_S3_SECRET_KEY,
+                        endpoint=SUPABASE_S3_ENDPOINT,
+                        force_path_style=True,
+                    ),
+                )],
+            )
+            info = await lk.egress.start_room_composite_egress(req)
+            return info.egress_id
+        finally:
+            await lk.aclose()
+    return asyncio.run(_run())
+
+
+def _stop_egress(egress_id: str) -> None:
+    """Stop a running egress. The file finalizes asynchronously afterwards."""
+    async def _run() -> None:
+        lk = _lk_api()
+        try:
+            await lk.egress.stop_egress(livekit_api.StopEgressRequest(egress_id=egress_id))
+        finally:
+            await lk.aclose()
+    asyncio.run(_run())
+
+
+def _active_recording(client, session_id: str):
+    rows = (client.table("meeting_recordings")
+            .select("id, egress_id, created_at")
+            .eq("live_session_id", session_id)
+            .eq("status", "active")
+            .limit(1).execute().data) or []
+    return rows[0] if rows else None
+
+
+def _maybe_start_recording(client, session: dict, member_id: str) -> str:
+    """Best-effort: start egress for a recording-enabled session and log the row.
+    Returns 'started' | 'already' | 'off' | 'failed' for the response."""
+    if not isinstance(session, dict) or not session.get("recording_enabled"):
+        return "off"
+    if not _recordings_configured():
+        return "off"
+    session_id = session["id"]
+    room_name = session.get("livekit_room") or session_id
+    try:
+        if _active_recording(client, session_id):
+            return "already"  # idempotent: a second joiner must not start a 2nd egress
+        object_key = f"{room_name}/{session_id}.ogg"
+        egress_id = _start_audio_egress(room_name, object_key)
+        _rpc_quiet(client, "svc_start_recording", {
+            "p_session_id": session_id,
+            "p_member_id": member_id,
+            "p_egress_id": egress_id,
+            "p_mode": "composite",
+            "p_bucket": RECORDINGS_BUCKET,
+            "p_path": object_key,
+        })
+        return "started"
+    except Exception as e:
+        print(f"[rec] start failed for session {session_id}: {e}")
+        return "failed"
+
+
+def _maybe_stop_recording(client, session_id: str) -> str:
+    """Best-effort: stop the active egress for a session and close out its row.
+    Returns 'stopped' | 'none' | 'failed'."""
+    rec = _active_recording(client, session_id)
+    if not rec:
+        return "none"
+    try:
+        _stop_egress(rec["egress_id"])
+        # Approximate the duration from the row's lifetime; the file's exact
+        # length is filled by the egress webhook later (B4 hardening).
+        dur = None
+        try:
+            created = datetime.fromisoformat(str(rec["created_at"]).replace("Z", "+00:00"))
+            dur = max(1, int((datetime.now(timezone.utc) - created).total_seconds()))
+        except Exception:
+            dur = None
+        _rpc_quiet(client, "svc_finish_recording", {
+            "p_recording_id": rec["id"],
+            "p_status": "completed",
+            "p_duration": dur,
+            "p_path": None,
+            "p_error": None,
+        })
+        return "stopped"
+    except Exception as e:
+        # Leave the row 'active' for a later webhook/reconcile rather than
+        # mislabel it; log loudly so a lingering egress gets noticed.
+        print(f"[rec] stop failed for session {session_id}: {e}")
+        return "failed"
+
+
 @app.post("/rtc/start")
 def rtc_start(
     room_id: str,
@@ -672,7 +827,8 @@ def rtc_start(
         "p_ai_minutes": ai_minutes,
         "p_waiting_room": waiting_room,
     })
-    return {"session": data}
+    rec_status = _maybe_start_recording(client, data, m["id"])
+    return {"session": data, "recording": rec_status}
 
 
 @app.post("/rtc/end")
@@ -687,7 +843,8 @@ def rtc_end(session_id: str, authorization: str = Header(default="")):
         "p_session_id": session_id,
         "p_member_id": m["id"],
     })
-    return {"session": data}
+    rec_status = _maybe_stop_recording(client, session_id)
+    return {"session": data, "recording": rec_status}
 
 
 @app.post("/rtc/consent")
