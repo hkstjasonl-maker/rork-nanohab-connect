@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenCapture from "expo-screen-capture";
-import { Headphones, Mic, Send, UserPlus, X } from "lucide-react-native";
+import { FileText, Headphones, Mic, Send, UserPlus, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -38,6 +38,13 @@ type RoomRow = {
 };
 
 type RoomMemberRow = { member_id: string | null };
+
+type RecordingRow = {
+  id: string;
+  status: string;
+  created_at: string;
+  recording_mode: string | null;
+};
 
 type CaseMemberRow = {
   member_id: string;
@@ -85,6 +92,31 @@ async function fetchMessages(roomId: string): Promise<MessageRow[]> {
   return (data ?? []) as unknown as MessageRow[];
 }
 
+async function fetchRecordings(roomId: string): Promise<RecordingRow[]> {
+  const sessions = await supabase
+    .from("live_sessions")
+    .select("id")
+    .eq("room_id", roomId);
+  if (sessions.error) {
+    throw sessions.error;
+  }
+  const sessionIds = ((sessions.data ?? []) as { id: string }[]).map(
+    (s) => s.id,
+  );
+  if (sessionIds.length === 0) {
+    return [];
+  }
+  const { data, error } = await supabase
+    .from("meeting_recordings")
+    .select("id, status, created_at, recording_mode")
+    .in("live_session_id", sessionIds)
+    .order("created_at", { ascending: false });
+  if (error) {
+    throw error;
+  }
+  return (data ?? []) as RecordingRow[];
+}
+
 async function fetchAddableMembers(
   roomId: string,
   caseId: string,
@@ -121,6 +153,7 @@ export default function RoomThreadScreen() {
 
   const [body, setBody] = useState<string>("");
   const [isAddOpen, setIsAddOpen] = useState<boolean>(false);
+  const [isRecordingsOpen, setIsRecordingsOpen] = useState<boolean>(false);
 
   // Lightweight clinical-surface protection while this screen is focused.
   useEffect(() => {
@@ -144,6 +177,12 @@ export default function RoomThreadScreen() {
   });
 
   const caseId = roomQuery.data?.case_id;
+
+  const recordingsQuery = useQuery({
+    queryKey: ["recordings", roomId],
+    queryFn: () => fetchRecordings(roomId),
+    enabled: !!roomId && isRecordingsOpen,
+  });
 
   const addableQuery = useQuery({
     queryKey: ["addable-members", roomId, caseId],
@@ -240,6 +279,13 @@ export default function RoomThreadScreen() {
                 <Mic color={Theme.primary} size={22} />
               </Pressable>
               <Pressable
+                onPress={() => setIsRecordingsOpen(true)}
+                hitSlop={12}
+                testID="recordings-button"
+              >
+                <FileText color={Theme.primary} size={22} />
+              </Pressable>
+              <Pressable
                 onPress={() => setIsAddOpen(true)}
                 hitSlop={12}
                 testID="add-member-button"
@@ -309,6 +355,62 @@ export default function RoomThreadScreen() {
           )}
         </Pressable>
       </View>
+
+      <Modal
+        visible={isRecordingsOpen}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setIsRecordingsOpen(false)}
+      >
+        <View style={styles.sheet}>
+          <View style={styles.sheetHeader}>
+            <Text style={styles.sheetTitle}>Recent recordings</Text>
+            <Pressable onPress={() => setIsRecordingsOpen(false)} hitSlop={12}>
+              <X color={Theme.textMuted} size={24} />
+            </Pressable>
+          </View>
+
+          {recordingsQuery.isLoading ? (
+            <ActivityIndicator color={Theme.primary} style={styles.loader} />
+          ) : (recordingsQuery.data ?? []).length === 0 ? (
+            <Text style={styles.emptyText}>
+              No recordings yet for this room.
+            </Text>
+          ) : (
+            <FlatList
+              data={recordingsQuery.data ?? []}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={styles.addList}
+              renderItem={({ item }) => (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.addRow,
+                    pressed && styles.addRowPressed,
+                  ]}
+                  onPress={() => {
+                    setIsRecordingsOpen(false);
+                    router.push(
+                      `/review/${item.id}?roomId=${roomId}`,
+                    );
+                  }}
+                  testID={`recording-${item.id}`}
+                >
+                  <View style={styles.addRowText}>
+                    <Text style={styles.memberName}>
+                      {formatTime(item.created_at)} ·{" "}
+                      {new Date(item.created_at).toLocaleDateString()}
+                    </Text>
+                    <Text style={styles.memberRole}>
+                      Review minutes
+                    </Text>
+                  </View>
+                  <FileText color={Theme.primary} size={20} />
+                </Pressable>
+              )}
+            />
+          )}
+        </View>
+      </Modal>
 
       <Modal
         visible={isAddOpen}
