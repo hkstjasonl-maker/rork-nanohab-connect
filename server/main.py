@@ -85,7 +85,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.12.1")
+app = FastAPI(title="NanoHab Connect API", version="0.13.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -1002,3 +1002,191 @@ def rtc_deny(session_id: str, member_id: str, authorization: str = Header(defaul
         "p_admit": False,
     })
     return {"admission": data}
+
+
+# ============================================================================
+# Stage B - B4b: diarized meeting transcription (the segment-aware lane).
+#
+# Distinct from the A8 voice-note path on purpose: that path joins Azure's
+# combinedPhrases into ONE text blob and drops timing + speaker. Meetings need
+# the opposite, so MeetingTranscriber parses the per-phrase `phrases[]` array
+# (speaker / offsetMilliseconds / durationMilliseconds / text / confidence) and
+# we persist SEGMENTS via the 017 svc_* RPCs. The voice-note path is untouched.
+#
+# Composite egress mixes everyone into one mono channel, so diarization must
+# GUESS how many voices are present. We cap maxSpeakers by the room's member
+# count, clamped to [2, 8]: a too-high cap makes diarization over-split one
+# voice into several. The clinician's speaker-confirm at review (B4d) is the
+# real source of truth - here we only need clean-ish clusters to map from.
+# TODO(B4 hardening): upgrade the speaker-count signal from room_members to the
+# actual LiveKit call participants once the egress/participant webhook is wired.
+# ============================================================================
+MEETING_TRANSCRIBE_LOCALE = os.environ.get("AZURE_MEETING_LOCALE", AZURE_BATCH_LOCALE or "zh-HK")
+
+
+def _meeting_max_speakers(client, room_id: str) -> int:
+    """Clamp the diarization speaker cap to the room's size, in [2, 8]."""
+    try:
+        rows = (client.table("room_members").select("id")
+                .eq("room_id", room_id).execute().data) or []
+        n = len(rows)
+    except Exception:
+        n = 0
+    return max(2, min(8, n or 2))
+
+
+class MeetingTranscriber:
+    """Azure fast transcription with diarization on, parsed into segments."""
+    name = "azure_fast_diar_v1"
+
+    def __init__(self, key: str, region: str, locale: str, api_version: str):
+        self.key, self.region, self.locale, self.api_version = key, region, locale, api_version
+
+    def transcribe(self, audio: bytes, max_speakers: int):
+        url = (
+            f"https://{self.region}.api.cognitive.microsoft.com"
+            f"/speechtotext/transcriptions:transcribe?api-version={self.api_version}"
+        )
+        definition: dict = {"diarization": {"maxSpeakers": int(max_speakers), "enabled": True}}
+        if self.locale:
+            definition["locales"] = [self.locale]
+        files = {
+            "audio": ("audio.ogg", audio, "application/octet-stream"),
+            "definition": (None, json.dumps(definition), "application/json"),
+        }
+        r = httpx.post(url, headers={"Ocp-Apim-Subscription-Key": self.key}, files=files, timeout=300)
+        if r.status_code == 429:
+            raise RateLimited("meeting transcription rate-limited (429)")
+        r.raise_for_status()
+        data = r.json()
+
+        # Per-phrase detail (carries speaker + timing); combinedPhrases is just
+        # the merged text we keep as full_text for quick reads/search.
+        phrases = data.get("phrases") or []
+        segments = []
+        for i, p in enumerate(phrases):
+            spk = p.get("speaker")
+            label = f"Speaker {spk}" if spk is not None else "Speaker ?"
+            off = p.get("offsetMilliseconds")
+            dur = p.get("durationMilliseconds")
+            conf = p.get("confidence")
+            segments.append({
+                "seq": i,
+                "speaker_label": label,
+                "start_ms": int(off) if off is not None else None,
+                "end_ms": (int(off) + int(dur)) if (off is not None and dur is not None) else None,
+                "text": (p.get("text") or "").strip(),
+                "confidence": float(conf) if conf is not None else None,
+            })
+
+        combined = data.get("combinedPhrases") or []
+        full_text = " ".join(c.get("text", "") for c in combined).strip()
+        if not full_text:  # fall back to stitching the phrases
+            full_text = " ".join(s["text"] for s in segments if s["text"]).strip()
+        seconds = int(round((data.get("durationMilliseconds") or 0) / 1000)) or 1
+        return full_text, segments, seconds
+
+
+class FakeMeetingTranscriber:
+    name = "fake_meeting_v0"
+
+    def transcribe(self, audio: bytes, max_speakers: int):
+        segs = [
+            {"seq": 0, "speaker_label": "Speaker 1", "start_ms": 0, "end_ms": 4000,
+             "text": "[fake] patient shows mild hoarseness", "confidence": 0.9},
+            {"seq": 1, "speaker_label": "Speaker 2", "start_ms": 4200, "end_ms": 9000,
+             "text": "[fake] recommend voice therapy twice a week", "confidence": 0.85},
+        ]
+        return ("[fake] patient shows mild hoarseness recommend voice therapy twice a week", segs, 9)
+
+
+def _get_meeting_transcriber():
+    if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        return MeetingTranscriber(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
+                                  MEETING_TRANSCRIBE_LOCALE, AZURE_FAST_API_VERSION)
+    return FakeMeetingTranscriber()
+
+
+def _download_meeting_audio(client, bucket: str, path: str) -> bytes:
+    """Pull the recording bytes from the (private) meeting-recordings bucket."""
+    return client.storage.from_(bucket).download(path)
+
+
+@app.post("/rtc/transcribe")
+def rtc_transcribe(recording_id: str, authorization: str = Header(default="")):
+    """
+    Manually transcribe a completed recording with diarization (B4b slice 1).
+
+    Flow: authenticate the caller -> svc_start_meeting_transcript (which enforces
+    room membership, recording-completed, and the ai_minutes_enabled credit gate
+    + is idempotent) -> download the .ogg -> Azure fast transcription w/
+    diarization -> store segments -> finish. Synchronous (meeting clips are
+    short). On any engine error the transcript row is marked 'failed' (never left
+    dangling) and a 502 is returned.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    # Create/return the transcript row (authorization + gating live in the RPC).
+    tr = _rpc(client, "svc_start_meeting_transcript", {
+        "p_recording_id": recording_id,
+        "p_member_id": m["id"],
+    })
+    if not isinstance(tr, dict) or not tr.get("id"):
+        raise HTTPException(status_code=500, detail="Could not start transcript")
+    transcript_id = tr["id"]
+
+    # Already done on a prior call? Return it without spending Azure credit again.
+    if tr.get("status") == "completed":
+        return {"transcript_id": transcript_id, "status": "completed",
+                "segment_count": tr.get("segment_count"), "speaker_count": tr.get("speaker_count"),
+                "language": tr.get("language"), "engine": tr.get("engine"), "reused": True}
+
+    # Look up the recording's bucket/path/room (service role; already authorized).
+    rec_rows = (client.table("meeting_recordings")
+                .select("storage_bucket, storage_path, room_id")
+                .eq("id", recording_id).limit(1).execute().data) or []
+    if not rec_rows or not rec_rows[0].get("storage_path"):
+        _rpc_quiet(client, "svc_finish_meeting_transcript", {
+            "p_transcript_id": transcript_id, "p_status": "failed",
+            "p_error": "recording has no storage_path"})
+        raise HTTPException(status_code=404, detail="Recording file not found")
+    rec = rec_rows[0]
+    bucket = rec.get("storage_bucket") or RECORDINGS_BUCKET
+
+    try:
+        audio = _download_meeting_audio(client, bucket, rec["storage_path"])
+        max_spk = _meeting_max_speakers(client, rec["room_id"])
+        engine = _get_meeting_transcriber()
+        full_text, segments, seconds = engine.transcribe(audio, max_spk)
+
+        if segments:
+            _rpc_quiet(client, "svc_write_transcript_segments", {
+                "p_transcript_id": transcript_id,
+                "p_segments": segments,
+            })
+        done = _rpc(client, "svc_finish_meeting_transcript", {
+            "p_transcript_id": transcript_id,
+            "p_status": "completed",
+            "p_full_text": full_text,
+            "p_engine": engine.name,
+            "p_language": MEETING_TRANSCRIBE_LOCALE,
+            "p_duration": seconds,
+            "p_error": None,
+        })
+        return {
+            "transcript_id": transcript_id,
+            "status": "completed",
+            "segment_count": done.get("segment_count") if isinstance(done, dict) else None,
+            "speaker_count": done.get("speaker_count") if isinstance(done, dict) else None,
+            "max_speakers_sent": max_spk,
+            "language": MEETING_TRANSCRIBE_LOCALE,
+            "engine": engine.name,
+            "duration_seconds": seconds,
+        }
+    except Exception as e:  # noqa: BLE001 - mark failed, surface a clean error
+        _rpc_quiet(client, "svc_finish_meeting_transcript", {
+            "p_transcript_id": transcript_id, "p_status": "failed",
+            "p_error": str(e)[:500]})
+        print(f"[transcribe] failed for recording {recording_id}: {e}")
+        raise HTTPException(status_code=502, detail="Transcription failed")
