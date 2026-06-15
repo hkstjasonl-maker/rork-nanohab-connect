@@ -88,7 +88,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.15.1")
+app = FastAPI(title="NanoHab Connect API", version="0.16.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -1267,12 +1267,14 @@ class MeetingTranscriber:
     def __init__(self, key: str, region: str, locale: str, api_version: str):
         self.key, self.region, self.locale, self.api_version = key, region, locale, api_version
 
-    def transcribe(self, audio: bytes, max_speakers: int):
+    def transcribe(self, audio: bytes, max_speakers: int, diarize: bool = True):
         url = (
             f"https://{self.region}.api.cognitive.microsoft.com"
             f"/speechtotext/transcriptions:transcribe?api-version={self.api_version}"
         )
-        definition: dict = {"diarization": {"maxSpeakers": int(max_speakers), "enabled": True}}
+        definition: dict = {}
+        if diarize:
+            definition["diarization"] = {"maxSpeakers": int(max_speakers), "enabled": True}
         if self.locale:
             definition["locales"] = [self.locale]
         files = {
@@ -1315,7 +1317,7 @@ class MeetingTranscriber:
 class FakeMeetingTranscriber:
     name = "fake_meeting_v0"
 
-    def transcribe(self, audio: bytes, max_speakers: int):
+    def transcribe(self, audio: bytes, max_speakers: int, diarize: bool = True):
         segs = [
             {"seq": 0, "speaker_label": "Speaker 1", "start_ms": 0, "end_ms": 4000,
              "text": "[fake] patient shows mild hoarseness", "confidence": 0.9},
@@ -1335,6 +1337,84 @@ def _get_meeting_transcriber():
 def _download_meeting_audio(client, bucket: str, path: str) -> bytes:
     """Pull the recording bytes from the (private) meeting-recordings bucket."""
     return client.storage.from_(bucket).download(path)
+
+
+def _member_label(client, member_id, identity) -> str:
+    """Display label for a per-track speaker: the member's name when resolvable,
+    else a guest marker. Attribution itself is the member_id, not this label."""
+    if member_id:
+        rows = (client.table("members").select("full_name")
+                .eq("id", member_id).limit(1).execute().data) or []
+        if rows and rows[0].get("full_name"):
+            return rows[0]["full_name"]
+        return "Member"
+    return "Guest"
+
+
+def _transcribe_per_track(client, recording_id: str, transcript_id: str, rec: dict) -> dict:
+    """Per-track transcription (B4 P3): transcribe EACH participant file on its
+    own (one voice per file -> diarization off), stamp every segment with that
+    file's member_id, then merge all segments by start_ms into one ordered
+    transcript. Attribution is exact and pre-filled — B4d becomes verify, not
+    guess. full_text is built as '<name>: <text>' lines, which also gives the
+    minutes LLM clean who-said-what structure."""
+    bucket = rec.get("storage_bucket") or RECORDINGS_BUCKET
+    tracks = (client.table("recording_tracks")
+              .select("member_id, participant_identity, storage_path")
+              .eq("recording_id", recording_id).eq("status", "completed")
+              .execute().data) or []
+    tracks = [t for t in tracks if t.get("storage_path")]
+    if not tracks:
+        _rpc_quiet(client, "svc_finish_meeting_transcript", {
+            "p_transcript_id": transcript_id, "p_status": "failed",
+            "p_error": "no per-track files (run /rtc/reconcile-tracks first)"})
+        raise HTTPException(status_code=409,
+                            detail="No per-track files yet; run /rtc/reconcile-tracks first")
+
+    engine = _get_meeting_transcriber()
+    merged, total_ms = [], 0
+    for t in tracks:
+        label = _member_label(client, t.get("member_id"), t.get("participant_identity"))
+        try:
+            audio = _download_meeting_audio(client, bucket, t["storage_path"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[transcribe] per_track download failed {t['storage_path']}: {e}")
+            continue
+        _ft, segs, secs = engine.transcribe(audio, 1, diarize=False)  # one voice per file
+        total_ms = max(total_ms, int(secs) * 1000)
+        for s in segs:
+            merged.append({
+                "start_ms": s.get("start_ms"),
+                "end_ms": s.get("end_ms"),
+                "text": s.get("text"),
+                "confidence": s.get("confidence"),
+                "speaker_member_id": t.get("member_id"),  # exact attribution
+                "speaker_label": label,
+            })
+
+    merged.sort(key=lambda s: s["start_ms"] if s["start_ms"] is not None else 0)
+    for i, s in enumerate(merged):
+        s["seq"] = i
+    full_text = "\n".join(f'{s["speaker_label"]}: {s["text"]}'
+                          for s in merged if (s.get("text") or "").strip())
+    seconds = int(round(total_ms / 1000)) or 1
+
+    if merged:
+        _rpc_quiet(client, "svc_write_transcript_segments", {
+            "p_transcript_id": transcript_id, "p_segments": merged})
+    engine_name = "azure_pertrack_v1"
+    done = _rpc(client, "svc_finish_meeting_transcript", {
+        "p_transcript_id": transcript_id, "p_status": "completed",
+        "p_full_text": full_text, "p_engine": engine_name,
+        "p_language": MEETING_TRANSCRIBE_LOCALE, "p_duration": seconds, "p_error": None})
+    return {
+        "transcript_id": transcript_id, "status": "completed", "mode": "per_track",
+        "track_count": len(tracks),
+        "segment_count": done.get("segment_count") if isinstance(done, dict) else None,
+        "speaker_count": done.get("speaker_count") if isinstance(done, dict) else None,
+        "language": MEETING_TRANSCRIBE_LOCALE, "engine": engine_name,
+        "duration_seconds": seconds,
+    }
 
 
 @app.post("/rtc/transcribe")
@@ -1367,16 +1447,36 @@ def rtc_transcribe(recording_id: str, authorization: str = Header(default="")):
                 "segment_count": tr.get("segment_count"), "speaker_count": tr.get("speaker_count"),
                 "language": tr.get("language"), "engine": tr.get("engine"), "reused": True}
 
-    # Look up the recording's bucket/path/room (service role; already authorized).
+    # Look up the recording's mode/bucket/path/room (service role; already authorized).
     rec_rows = (client.table("meeting_recordings")
-                .select("storage_bucket, storage_path, room_id")
+                .select("storage_bucket, storage_path, room_id, recording_mode")
                 .eq("id", recording_id).limit(1).execute().data) or []
-    if not rec_rows or not rec_rows[0].get("storage_path"):
+    if not rec_rows:
+        _rpc_quiet(client, "svc_finish_meeting_transcript", {
+            "p_transcript_id": transcript_id, "p_status": "failed",
+            "p_error": "recording not found"})
+        raise HTTPException(status_code=404, detail="Recording not found")
+    rec = rec_rows[0]
+
+    # per_track: transcribe each participant file and merge (exact attribution).
+    if (rec.get("recording_mode") or "composite") == "per_track":
+        try:
+            return _transcribe_per_track(client, recording_id, transcript_id, rec)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            _rpc_quiet(client, "svc_finish_meeting_transcript", {
+                "p_transcript_id": transcript_id, "p_status": "failed",
+                "p_error": str(e)[:500]})
+            print(f"[transcribe] per_track failed for recording {recording_id}: {e}")
+            raise HTTPException(status_code=502, detail="Per-track transcription failed")
+
+    # composite (fallback): single mixed file with diarization.
+    if not rec.get("storage_path"):
         _rpc_quiet(client, "svc_finish_meeting_transcript", {
             "p_transcript_id": transcript_id, "p_status": "failed",
             "p_error": "recording has no storage_path"})
         raise HTTPException(status_code=404, detail="Recording file not found")
-    rec = rec_rows[0]
     bucket = rec.get("storage_bucket") or RECORDINGS_BUCKET
 
     try:
