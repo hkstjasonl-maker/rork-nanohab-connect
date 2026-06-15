@@ -85,7 +85,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.12.0")
+app = FastAPI(title="NanoHab Connect API", version="0.12.1")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -737,6 +737,25 @@ def _stop_egress(egress_id: str) -> None:
     asyncio.run(_run())
 
 
+def _ensure_room(room_name: str) -> None:
+    """Create the LiveKit room if it doesn't exist yet (idempotent).
+
+    Composite egress attaches to an existing room; if recording starts before
+    the first participant joins (e.g. host enables recording at go-live, or a
+    server-driven start), the room would not exist and egress 404s. We set a
+    short empty_timeout so the room lingers briefly while joiners arrive.
+    """
+    async def _run() -> None:
+        lk = _lk_api()
+        try:
+            await lk.room.create_room(
+                livekit_api.CreateRoomRequest(name=room_name, empty_timeout=300)
+            )
+        finally:
+            await lk.aclose()
+    asyncio.run(_run())
+
+
 def _active_recording(client, session_id: str):
     rows = (client.table("meeting_recordings")
             .select("id, egress_id, created_at")
@@ -759,6 +778,7 @@ def _maybe_start_recording(client, session: dict, member_id: str) -> str:
         if _active_recording(client, session_id):
             return "already"  # idempotent: a second joiner must not start a 2nd egress
         object_key = f"{room_name}/{session_id}.ogg"
+        _ensure_room(room_name)
         egress_id = _start_audio_egress(room_name, object_key)
         _rpc_quiet(client, "svc_start_recording", {
             "p_session_id": session_id,
