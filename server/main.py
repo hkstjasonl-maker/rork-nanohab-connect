@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.19.0")
+app = FastAPI(title="NanoHab Connect API", version="0.20.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -1632,13 +1632,25 @@ def _download_meeting_audio(client, bucket: str, path: str) -> bytes:
 
 def _member_label(client, member_id, identity) -> str:
     """Display label for a per-track speaker: the member's name when resolvable,
-    else a guest marker. Attribution itself is the member_id, not this label."""
+    a guest's invitation display_name for 'guest_<invitation_id>' identities,
+    else a generic guest marker. Attribution itself is member_id (null for
+    guests) — this is only the human-readable label on the transcript."""
     if member_id:
         rows = (client.table("members").select("full_name")
                 .eq("id", member_id).limit(1).execute().data) or []
         if rows and rows[0].get("full_name"):
             return rows[0]["full_name"]
         return "Member"
+    # Guest: per-track egress wrote identity as 'guest_<invitation_id>' (B3).
+    if isinstance(identity, str) and identity.startswith("guest_"):
+        inv_id = identity[len("guest_"):]
+        try:
+            rows = (client.table("guest_invitations").select("display_name")
+                    .eq("id", inv_id).limit(1).execute().data) or []
+            if rows and rows[0].get("display_name"):
+                return rows[0]["display_name"]
+        except Exception:  # noqa: BLE001 — bad id -> fall through to generic marker
+            pass
     return "Guest"
 
 
