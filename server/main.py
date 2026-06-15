@@ -26,9 +26,11 @@ Config comes from environment variables (set in Cloud Run, never in code):
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -46,7 +48,9 @@ LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
 OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
-
+# Base URL of the guest web app (B3 S4). Magic links are built as
+# {GUEST_BASE_URL}/j#<raw-token>. Placeholder until the guest surface is hosted.
+GUEST_BASE_URL = os.environ.get("GUEST_BASE_URL", "https://connect.nanohab.com")
 # LiveKit egress -> object storage (Stage B4a). Composite audio is mixed
 # server-side and written to an S3-compatible bucket; we use Supabase Storage's
 # S3 endpoint so the file lands in the same project/region as everything else
@@ -88,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.18.0")
+app = FastAPI(title="NanoHab Connect API", version="0.19.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -280,6 +284,211 @@ def rtc_token(room_id: str, authorization: str = Header(default="")):
         "url": LIVEKIT_URL,
         "room": room_id,
         "identity": m["id"],
+    }
+
+
+# ============================================================================
+# Stage B - B3: no-install guests via magic link (S2 backend).
+#
+# Guests NEVER touch RLS. Every guest call validates a raw token against the
+# stored HASH (token_hash) server-side (service role) and returns only the
+# permitted slice. Flow: a member mints a link (/rtc/invite-guest) -> guest
+# opens it -> /guest/resolve (render join + consent screen) -> /guest/consent
+# (the gate) -> /guest/livekit-token (only if consented AND a live session
+# exists in their room). Reusable until expiry; revoke + consent-gate +
+# session-window are the real guards. Single-use is a documented fast-follow.
+# ============================================================================
+
+def _token_hash(raw: str) -> str:
+    return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+
+
+def _guest_invite_row(client, token_hash: str):
+    rows = (client.table("guest_invitations")
+            .select("id, room_id, session_id, guest_kind, role, display_name, "
+                    "language, status, expires_at, consent_at, consent_recording, consent_ai")
+            .eq("token_hash", token_hash).limit(1).execute().data) or []
+    return rows[0] if rows else None
+
+
+def _guest_expired(inv: dict) -> bool:
+    try:
+        exp = datetime.fromisoformat(str(inv["expires_at"]).replace("Z", "+00:00"))
+        return exp <= datetime.now(timezone.utc)
+    except Exception:  # noqa: BLE001 — unparseable expiry -> treat as expired (safe)
+        return True
+
+
+@app.post("/rtc/invite-guest")
+def rtc_invite_guest(
+    room_id: str,
+    guest_kind: str,
+    role: str,
+    display_name: str,
+    language: str = "zh-Hant-HK",
+    principal_member_id: str = "",
+    session_id: str = "",
+    expires_in_hours: int = 24,
+    authorization: str = Header(default=""),
+):
+    """
+    Member mints a guest magic link. Generates a high-entropy raw token, stores
+    ONLY its hash, and returns the raw token + join URL ONCE (never retrievable
+    again). Authorization (inviter + any principal must be room members) is
+    enforced inside svc_create_guest_invitation.
+    """
+    if guest_kind not in ("external", "delegate"):
+        raise HTTPException(status_code=400, detail="guest_kind must be 'external' or 'delegate'")
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    raw = secrets.token_urlsafe(32)
+    hours = max(1, min(int(expires_in_hours or 24), 168))  # clamp 1h..7d
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+    inv = _rpc(client, "svc_create_guest_invitation", {
+        "p_room_id": room_id,
+        "p_invited_by": m["id"],
+        "p_guest_kind": guest_kind,
+        "p_role": role,
+        "p_display_name": display_name,
+        "p_token_hash": _token_hash(raw),
+        "p_expires_at": expires_at,
+        "p_language": language,
+        "p_principal_member_id": _none_if_blank(principal_member_id),
+        "p_session_id": _none_if_blank(session_id),
+    })
+    inv_id = inv.get("id") if isinstance(inv, dict) else None
+    if not inv_id:
+        raise HTTPException(status_code=500, detail="Could not create invitation")
+    # The raw token lives only in this response; the link puts it in the URL
+    # fragment (#) so it is never sent to the server in a referrer / access log.
+    return {
+        "invitation_id": inv_id,
+        "token": raw,
+        "join_url": f"{GUEST_BASE_URL}/j#{raw}",
+        "expires_at": expires_at,
+        "role": role,
+        "guest_kind": guest_kind,
+        "display_name": display_name,
+        "language": language,
+    }
+
+
+@app.post("/guest/resolve")
+def guest_resolve(token: str = Body(..., embed=True)):
+    """
+    No auth. Render-the-join-screen view for a guest holding a raw link token.
+    Returns room title/type + the guest's role/language + whether the link is
+    usable and whether consent has already been given. Bumps last_seen.
+    """
+    client = get_service_client()
+    inv = _guest_invite_row(client, _token_hash(token))
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invalid or unknown link")
+
+    expired = _guest_expired(inv)
+    usable = (inv["status"] == "active") and not expired
+
+    room = (client.table("rooms").select("title, room_type, status")
+            .eq("id", inv["room_id"]).limit(1).execute().data or [{}])[0]
+
+    client.table("guest_invitations").update(
+        {"last_seen_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", inv["id"]).execute()
+
+    return {
+        "room_id": inv["room_id"],
+        "room_title": room.get("title"),
+        "room_type": room.get("room_type"),
+        "display_name": inv["display_name"],
+        "role": inv["role"],
+        "guest_kind": inv["guest_kind"],
+        "language": inv["language"],
+        "status": inv["status"],
+        "expired": expired,
+        "usable": usable,
+        "consent_given": inv.get("consent_at") is not None,
+    }
+
+
+@app.post("/guest/consent")
+def guest_consent(
+    token: str = Body(..., embed=True),
+    recording: bool = Body(..., embed=True),
+    ai: bool = Body(..., embed=True),
+    text_version: str = Body(default="guest_consent_v1", embed=True),
+):
+    """
+    No auth. The gate: record the guest's recording/AI consent. svc_guest_consent
+    refuses unknown / revoked / consumed / expired links.
+    """
+    client = get_service_client()
+    row = _rpc(client, "svc_guest_consent", {
+        "p_token_hash": _token_hash(token),
+        "p_recording": bool(recording),
+        "p_ai": bool(ai),
+        "p_text_version": text_version,
+    })
+    return {
+        "consent_at": row.get("consent_at") if isinstance(row, dict) else None,
+        "recording": bool(recording),
+        "ai": bool(ai),
+        "status": row.get("status") if isinstance(row, dict) else None,
+    }
+
+
+@app.post("/guest/livekit-token")
+def guest_livekit_token(token: str = Body(..., embed=True)):
+    """
+    No auth. Mint a LiveKit join token for a consented guest — but ONLY while a
+    live session exists in their room (the session-window guard). Identity is
+    'guest_<invitation_id>' (never a member id), so per-track egress attributes
+    the audio to the guest, not a member. Room grant = room_id (same value member
+    tokens use), so the guest lands in the same realtime room as the clinicians.
+    """
+    if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        raise HTTPException(status_code=500, detail="LiveKit is not configured")
+    client = get_service_client()
+    inv = _guest_invite_row(client, _token_hash(token))
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invalid or unknown link")
+    if inv["status"] != "active":
+        raise HTTPException(status_code=403, detail="Link is not active")
+    if _guest_expired(inv):
+        raise HTTPException(status_code=403, detail="Link expired")
+    if not inv.get("consent_at"):
+        raise HTTPException(status_code=409, detail="Consent required before joining")
+
+    # Session-window: pinned session if the invite names one, else any live
+    # session in the room. No live session -> nothing to join yet.
+    q = (client.table("live_sessions").select("id, status")
+         .eq("room_id", inv["room_id"]).eq("status", "live"))
+    if inv.get("session_id"):
+        q = q.eq("id", inv["session_id"])
+    live = (q.limit(1).execute().data) or []
+    if not live:
+        raise HTTPException(status_code=409, detail="No live session to join yet")
+
+    identity = f"guest_{inv['id']}"
+    grants = livekit_api.VideoGrants(
+        room_join=True, room=inv["room_id"], can_publish=True, can_subscribe=True)
+    access = (
+        livekit_api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identity)
+        .with_name(inv["display_name"])
+        .with_grants(grants)
+        .with_ttl(timedelta(hours=2))
+    )
+    client.table("guest_invitations").update(
+        {"last_seen_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", inv["id"]).execute()
+    return {
+        "token": access.to_jwt(),
+        "url": LIVEKIT_URL,
+        "room": inv["room_id"],
+        "identity": identity,
+        "display_name": inv["display_name"],
     }
 
 
