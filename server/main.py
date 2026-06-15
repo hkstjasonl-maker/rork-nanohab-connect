@@ -88,7 +88,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.15.0")
+app = FastAPI(title="NanoHab Connect API", version="0.15.1")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -844,6 +844,51 @@ def _session_room(client, session_id: str) -> str:
     return (rows[0].get("livekit_room") if rows else None) or session_id
 
 
+def _list_session_track_files(client, bucket: str, room_id: str, session_id: str):
+    """Reconcile per-track files from STORAGE (the source of truth), not from
+    list_egress — so it is immune to LiveKit room reuse / delete+recreate.
+
+    Auto-track egress writes, per participant, into:
+      {room_id}/{session_id}/p_<publisher_identity>/t_<track_id>.ogg   (audio)
+      {room_id}/{session_id}/p_<publisher_identity>/EG_<egress_id>.json (manifest)
+    Returns [{identity, audio_path, egress_id, track_id}]."""
+    base = f"{room_id}/{session_id}"
+    out = []
+    try:
+        folders = client.storage.from_(bucket).list(base) or []
+    except Exception as e:
+        print(f"[rec] storage list '{base}' failed: {e}")
+        return out
+    for f in folders:
+        fname = (f or {}).get("name") or ""
+        if not fname.startswith("p_"):
+            continue  # only participant folders
+        identity = fname[2:]
+        folder = f"{base}/{fname}"
+        audio_path, egress_id, track_id = None, None, None
+        try:
+            files = client.storage.from_(bucket).list(folder) or []
+        except Exception:
+            files = []
+        for fi in files:
+            n = (fi or {}).get("name") or ""
+            if n.endswith(".ogg"):
+                audio_path = f"{folder}/{n}"
+                if n.startswith("t_"):
+                    track_id = n[2:].rsplit(".", 1)[0]
+            elif n.startswith("EG_") and n.endswith(".json"):
+                egress_id = n[:-5]  # manifest filename stem is the egress id
+        if audio_path:
+            out.append({
+                "identity": identity,
+                "audio_path": audio_path,
+                # dedup key for svc_record_track: egress id if known, else stable path
+                "egress_id": egress_id or audio_path,
+                "track_id": track_id,
+            })
+    return out
+
+
 def _active_recording(client, session_id: str):
     rows = (client.table("meeting_recordings")
             .select("id, egress_id, recording_mode, created_at")
@@ -924,16 +969,10 @@ def _maybe_stop_recording(client, session_id: str) -> str:
 
     try:
         if mode == "per_track":
-            room_name = _session_room(client, session_id)
-            try:
-                for e in _list_room_egresses(room_name):
-                    if e["egress_id"] and e["status"] in (0, 1, 2):  # starting/active/ending
-                        try:
-                            _stop_egress(e["egress_id"])
-                        except Exception:
-                            pass
-            except Exception as ex:
-                print(f"[rec] per_track stop-list failed for {session_id}: {ex}")
+            # Track egresses auto-stop when each participant unpublishes (leaves),
+            # so by /rtc/end the files are already finalizing. Just close the
+            # parent; the per-track FILES are written by /rtc/reconcile-tracks,
+            # which reads them from storage (immune to LiveKit room reuse).
             _rpc_quiet(client, "svc_finish_recording", {
                 "p_recording_id": rec["id"], "p_status": "completed",
                 "p_duration": _approx_dur(), "p_path": None, "p_error": None,
@@ -997,19 +1036,19 @@ def rtc_end(session_id: str, authorization: str = Header(default="")):
 @app.post("/rtc/reconcile-tracks")
 def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default="")):
     """
-    For a per_track recording, list the room's egresses and write each finalized
-    track file into recording_tracks (idempotent upsert via svc_record_track).
-    Attribution comes from the templated path ('/p_<member-id>/'), not diarization.
+    For a per_track recording, list the session's per-participant files from
+    STORAGE and write each into recording_tracks (idempotent upsert via
+    svc_record_track). Attribution comes from the templated path
+    ('/p_<member-id>/'), not diarization. Immune to LiveKit room reuse.
 
     Call AFTER /rtc/end and a short wait (track files finalize asynchronously).
-    Re-runnable; tracks still finalizing come back with status 'active' and can be
-    reconciled again later. This also seeds B4b' per-track transcription.
+    Re-runnable. Seeds B4b' per-track transcription.
     """
     m = resolve_member(authorization)
     client = get_service_client()
 
     rows = (client.table("meeting_recordings")
-            .select("id, live_session_id, room_id, recording_mode")
+            .select("id, live_session_id, room_id, recording_mode, storage_bucket")
             .eq("id", recording_id).limit(1).execute().data) or []
     if not rows:
         raise HTTPException(status_code=404, detail="No such recording")
@@ -1020,28 +1059,22 @@ def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default=
     if (rec.get("recording_mode") or "composite") != "per_track":
         raise HTTPException(status_code=400, detail="Not a per_track recording")
 
-    session_id = rec["live_session_id"]
-    room_name = _session_room(client, session_id)
-    prefix = f"{room_name}/{session_id}"
+    bucket = rec.get("storage_bucket") or RECORDINGS_BUCKET
+    files = _list_session_track_files(client, bucket, rec["room_id"], rec["live_session_id"])
 
     found, tracks = 0, []
-    for e in _list_room_egresses(room_name):
-        fname = e.get("filename")
-        if not fname or prefix not in fname:
-            continue  # only this session's per-track files
+    for fobj in files:
         found += 1
-        st = e["status"]
-        status = "completed" if st == 3 else ("failed" if st in (4, 5) else "active")
         row = _rpc_quiet(client, "svc_record_track", {
             "p_recording_id": recording_id,
             "p_member_id": m["id"],
-            "p_participant_identity": e.get("identity"),
-            "p_egress_id": e.get("egress_id"),
-            "p_track_id": e.get("track_id"),
-            "p_bucket": RECORDINGS_BUCKET,
-            "p_path": fname,
-            "p_status": status,
-            "p_duration": e.get("duration_s"),
+            "p_participant_identity": fobj["identity"],
+            "p_egress_id": fobj["egress_id"],
+            "p_track_id": fobj["track_id"],
+            "p_bucket": bucket,
+            "p_path": fobj["audio_path"],
+            "p_status": "completed",
+            "p_duration": None,
             "p_error": None,
         })
         resolved = None
@@ -1050,12 +1083,10 @@ def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default=
         elif isinstance(row, dict):
             resolved = row.get("member_id")
         tracks.append({
-            "identity": e.get("identity"),
+            "identity": fobj["identity"],
             "member_id": resolved,
-            "egress_id": e.get("egress_id"),
-            "path": fname,
-            "status": status,
-            "duration_s": e.get("duration_s"),
+            "path": fobj["audio_path"],
+            "egress_id": fobj["egress_id"],
         })
 
     return {"recording_id": recording_id, "tracks_found": found, "tracks": tracks}
