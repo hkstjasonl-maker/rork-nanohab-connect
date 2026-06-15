@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
 from livekit import api as livekit_api
@@ -88,7 +88,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.16.0")
+app = FastAPI(title="NanoHab Connect API", version="0.17.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -1736,7 +1736,7 @@ def rtc_minutes_read(recording_id: str, authorization: str = Header(default=""))
     decisions = (client.table("meeting_decisions").select("seq, text")
                  .eq("transcript_id", transcript_id).order("seq").execute().data) or []
     actions = (client.table("meeting_action_items")
-               .select("seq, text, owner_hint, due_hint, status, kind, owner_member_id, promoted_at")
+               .select("id, seq, text, owner_hint, due_hint, status, kind, owner_member_id, promoted_at")
                .eq("transcript_id", transcript_id).order("seq").execute().data) or []
 
     return {
@@ -1745,3 +1745,110 @@ def rtc_minutes_read(recording_id: str, authorization: str = Header(default=""))
         "action_items": [a for a in actions if a.get("kind") == "explicit"],
         "suggested_action_items": [a for a in actions if a.get("kind") == "suggested"],
     }
+
+
+# ============================================================================
+# Stage B - B4d: clinician review/sign endpoints (thin wrappers over the 022
+# service-role RPCs). Each authenticates the caller and passes an explicit
+# p_member_id; the RPC does the membership check and drives the provenance guard.
+# ============================================================================
+def _none_if_blank(s):
+    return s if (s is not None and s != "") else None
+
+
+@app.get("/rtc/transcript")
+def rtc_transcript_read(recording_id: str, authorization: str = Header(default="")):
+    """Read a recording's transcript segments (with pre-filled per-track speaker
+    attribution) for the review screen."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    tr = _completed_transcript_for(client, recording_id)
+    if not tr:
+        raise HTTPException(status_code=404, detail="No completed transcript for this recording")
+    if not (client.table("room_members").select("id")
+            .eq("room_id", tr["room_id"]).eq("member_id", m["id"]).limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    segs = (client.table("transcript_segments")
+            .select("id, seq, speaker_label, speaker_member_id, start_ms, end_ms, text, confidence")
+            .eq("transcript_id", tr["id"]).order("seq").execute().data) or []
+    return {"transcript_id": tr["id"], "segments": segs}
+
+
+@app.post("/rtc/segment-speaker")
+def rtc_segment_speaker(segment_id: str, speaker_member_id: str = "",
+                        speaker_label: str = "", authorization: str = Header(default="")):
+    """Confirm/correct a segment's speaker (per-track pre-fills it)."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_set_segment_speaker", {
+        "p_segment_id": segment_id, "p_member_id": m["id"],
+        "p_speaker_member_id": _none_if_blank(speaker_member_id),
+        "p_speaker_label": _none_if_blank(speaker_label),
+    })
+    return {"segment": row}
+
+
+@app.post("/rtc/minutes/review")
+def rtc_minutes_review(artifact_id: str, authorization: str = Header(default="")):
+    """Move minutes drafted -> under_review."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_begin_minutes_review", {
+        "p_artifact_id": artifact_id, "p_member_id": m["id"]})
+    return {"minutes": row}
+
+
+@app.post("/rtc/minutes/edit")
+def rtc_minutes_edit(artifact_id: str, text: str = Body(..., embed=True),
+                     authorization: str = Header(default="")):
+    """Save the clinician's working edits (keeps state; blocked once signed)."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_save_minutes_edit", {
+        "p_artifact_id": artifact_id, "p_member_id": m["id"], "p_edited_text": text})
+    return {"minutes": row}
+
+
+@app.post("/rtc/minutes/approve")
+def rtc_minutes_approve(artifact_id: str, text: str = Body(..., embed=True),
+                        authorization: str = Header(default="")):
+    """Sign the minutes: (drafted|under_review) -> approved, recording the signer.
+    This is the provenance event."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_approve_minutes", {
+        "p_artifact_id": artifact_id, "p_member_id": m["id"], "p_text": text})
+    return {"minutes": row}
+
+
+@app.post("/rtc/action-item/promote")
+def rtc_action_item_promote(action_item_id: str, authorization: str = Header(default="")):
+    """Promote a suggested action item to confirmed (kind='explicit', promoted_at)."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_promote_action_item", {
+        "p_action_item_id": action_item_id, "p_member_id": m["id"]})
+    return {"action_item": row}
+
+
+@app.post("/rtc/action-item/status")
+def rtc_action_item_status(action_item_id: str, status: str,
+                           authorization: str = Header(default="")):
+    """Set an action item's status: open | done | cancelled."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_set_action_item_status", {
+        "p_action_item_id": action_item_id, "p_member_id": m["id"], "p_status": status})
+    return {"action_item": row}
+
+
+@app.post("/rtc/action-item/owner")
+def rtc_action_item_owner(action_item_id: str, owner_member_id: str = "",
+                          authorization: str = Header(default="")):
+    """Map an action item's owner to a real member (blank clears it)."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+    row = _rpc(client, "svc_set_action_item_owner", {
+        "p_action_item_id": action_item_id, "p_member_id": m["id"],
+        "p_owner_member_id": _none_if_blank(owner_member_id)})
+    return {"action_item": row}
