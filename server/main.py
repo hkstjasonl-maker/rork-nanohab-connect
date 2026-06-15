@@ -85,7 +85,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.13.0")
+app = FastAPI(title="NanoHab Connect API", version="0.14.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -1190,3 +1190,233 @@ def rtc_transcribe(recording_id: str, authorization: str = Header(default="")):
             "p_error": str(e)[:500]})
         print(f"[transcribe] failed for recording {recording_id}: {e}")
         raise HTTPException(status_code=502, detail="Transcription failed")
+
+
+# ============================================================================
+# Stage B - B4c: AI meeting minutes from a transcript.
+#
+# Reuses the ai_artifacts provenance machine (007) via the 018/019 svc_* RPCs:
+# minutes are a typed artifact (meeting_minutes) that goes transcribed->drafted
+# and later review/sign (B4d). Decisions + EXPLICIT action items are written as
+# confirmed extractions; in 'detailed' style, INFERRED follow-ups are written
+# separately as kind='suggested' (offset seq) so they can never masquerade as
+# confirmed clinical instructions - the clinician promotes them at review.
+#
+# Engine identity is a LABEL ('minutes_v1'), never a model name. Conservative by
+# construction: the prompt forbids inventing facts and separates 'said' from
+# 'suggested'. Residency note (B4c hardening, not a blocker): move this Azure
+# OpenAI deployment to an Asia region + disable prompt retention before launch.
+# ============================================================================
+import re as _re_minutes
+
+
+def _parse_minutes_json(raw: str) -> dict:
+    """Defensively parse the model's JSON (tolerate code fences / stray prose)."""
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = _re_minutes.sub(r"^```[a-zA-Z]*\n?", "", s)
+        s = _re_minutes.sub(r"\n?```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        m = _re_minutes.search(r"\{.*\}", s, _re_minutes.DOTALL)  # first {...} block
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    raise ValueError("minutes model did not return valid JSON")
+
+
+class FakeMinutes:
+    name = "minutes_fake_v0"
+
+    def generate(self, transcript: str, style: str) -> dict:
+        out = {
+            "minutes": "[fake] MDT summary: mild hoarseness discussed; voice therapy plan agreed.",
+            "decisions": [{"text": "Start voice therapy twice weekly"}],
+            "action_items": [{"text": "Book first voice therapy session", "owner_hint": "SLP", "due_hint": "this week"}],
+        }
+        if style == "detailed":
+            out["suggested_action_items"] = [
+                {"text": "Consider GERD review (implied, confirm)", "owner_hint": "GP", "due_hint": None}
+            ]
+        return out
+
+
+class MinutesGenerator:
+    name = "minutes_v1"  # provenance LABEL, never a model name
+
+    _BASE = (
+        "You are a clinical meeting-minutes assistant for a Hong Kong allied-health / MDT team. "
+        "You receive a diarized speech-to-text transcript of a multi-party clinical meeting. It is "
+        "Hong Kong Cantonese mixed with English clinical terms and MAY contain transcription errors, "
+        "especially at Cantonese-English boundaries. "
+        "Produce DRAFT minutes for a clinician to review. Hard rules: "
+        "(1) NEVER invent clinical facts, names, numbers, doses, or recommendations not supported by "
+        "the transcript. If unclear, omit rather than guess. "
+        "(2) Keep the original language mix; do NOT translate. Use Hong Kong written-Cantonese "
+        "conventions and Traditional Chinese; preserve English terms exactly. "
+        "(3) A 'decision' is something the group EXPLICITLY agreed. An 'action_item' is a task someone "
+        "was EXPLICITLY asked to do; capture owner_hint (the name/role as said) and due_hint (the timing "
+        "as said) only if stated, else null. Do not assign owners that were not named. "
+        "(4) Output ONLY a single JSON object, no markdown, no preamble."
+    )
+    _TIGHT = (
+        " Style: TIGHT. Include only explicitly-stated decisions and action items. "
+        'JSON shape: {"minutes": "<concise prose summary>", '
+        '"decisions": [{"text": "..."}], '
+        '"action_items": [{"text": "...", "owner_hint": "...|null", "due_hint": "...|null"}]}.'
+    )
+    _DETAILED = (
+        " Style: DETAILED. In addition to explicit decisions/action items, you MAY add inferred "
+        "follow-ups the discussion IMPLIED but did not explicitly assign - but ONLY in a separate "
+        "'suggested_action_items' array, each phrased as a suggestion to confirm, never as fact. "
+        'JSON shape: {"minutes": "<prose summary, may include a brief topic structure>", '
+        '"decisions": [{"text": "..."}], '
+        '"action_items": [{"text": "...", "owner_hint": "...|null", "due_hint": "...|null"}], '
+        '"suggested_action_items": [{"text": "... (confirm)", "owner_hint": "...|null", "due_hint": "...|null"}]}.'
+    )
+
+    def __init__(self, endpoint: str, key: str, deployment: str, api_version: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.key, self.deployment, self.api_version = key, deployment, api_version
+
+    def generate(self, transcript: str, style: str) -> dict:
+        system = self._BASE + (self._DETAILED if style == "detailed" else self._TIGHT)
+        url = (f"{self.endpoint}/openai/deployments/{self.deployment}"
+               f"/chat/completions?api-version={self.api_version}")
+        body = {
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": (transcript or "").strip()},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1500,
+        }
+        r = httpx.post(url, headers={"api-key": self.key, "Content-Type": "application/json"},
+                       json=body, timeout=90)
+        r.raise_for_status()
+        content = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        return _parse_minutes_json(content)
+
+
+def get_minutes_generator():
+    if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT:
+        return MinutesGenerator(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY,
+                                AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION)
+    return FakeMinutes()
+
+
+def _completed_transcript_for(client, recording_id: str):
+    rows = (client.table("meeting_transcripts")
+            .select("id, room_id, full_text, status")
+            .eq("recording_id", recording_id).eq("status", "completed")
+            .order("created_at", desc=True).limit(1).execute().data) or []
+    return rows[0] if rows else None
+
+
+@app.post("/rtc/minutes")
+def rtc_minutes(recording_id: str, style: str = "tight", authorization: str = Header(default="")):
+    """
+    Generate AI minutes for a recording's completed transcript (B4c).
+
+    style = 'tight' (explicit only) | 'detailed' (adds flagged suggested items).
+    Flow: find the completed transcript -> svc_create_minutes_artifact (gates on
+    membership + ai_minutes) -> LLM -> svc_set_minutes_draft (the prose) ->
+    svc_write_meeting_extractions (decisions + explicit actions) -> if detailed,
+    svc_write_suggested_action_items (inferred, offset seq). Idempotent on the
+    artifact: a second call returns the existing drafted minutes without re-spend.
+    """
+    if style not in ("tight", "detailed"):
+        raise HTTPException(status_code=400, detail="style must be 'tight' or 'detailed'")
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    tr = _completed_transcript_for(client, recording_id)
+    if not tr:
+        raise HTTPException(status_code=409, detail="No completed transcript for this recording (run /rtc/transcribe first)")
+    transcript_id = tr["id"]
+
+    art = _rpc(client, "svc_create_minutes_artifact", {
+        "p_transcript_id": transcript_id, "p_member_id": m["id"]})
+    if not isinstance(art, dict) or not art.get("id"):
+        raise HTTPException(status_code=500, detail="Could not create minutes artifact")
+    artifact_id = art["id"]
+
+    # Already drafted on a prior call -> return it without re-spending the LLM.
+    if art.get("state") in ("drafted", "under_review", "approved", "posted"):
+        return {"minutes_artifact_id": artifact_id, "state": art["state"], "reused": True}
+
+    try:
+        engine = get_minutes_generator()
+        result = engine.generate(tr.get("full_text") or "", style)
+
+        minutes_text = (result.get("minutes") or "").strip()
+        decisions = [{"seq": i, "text": (d.get("text") or "").strip()}
+                     for i, d in enumerate(result.get("decisions") or []) if (d.get("text") or "").strip()]
+        actions = [{"seq": i, "text": (a.get("text") or "").strip(),
+                    "owner_hint": a.get("owner_hint"), "due_hint": a.get("due_hint")}
+                   for i, a in enumerate(result.get("action_items") or []) if (a.get("text") or "").strip()]
+        suggested = []
+        if style == "detailed":
+            suggested = [{"seq": 1000 + i, "text": (s.get("text") or "").strip(),
+                          "owner_hint": s.get("owner_hint"), "due_hint": s.get("due_hint")}
+                         for i, s in enumerate(result.get("suggested_action_items") or []) if (s.get("text") or "").strip()]
+
+        _rpc(client, "svc_set_minutes_draft", {
+            "p_artifact_id": artifact_id, "p_member_id": m["id"],
+            "p_draft": minutes_text, "p_engine_version": engine.name})
+        _rpc_quiet(client, "svc_write_meeting_extractions", {
+            "p_transcript_id": transcript_id, "p_minutes_artifact_id": artifact_id,
+            "p_member_id": m["id"], "p_decisions": decisions, "p_action_items": actions})
+        if suggested:
+            _rpc_quiet(client, "svc_write_suggested_action_items", {
+                "p_transcript_id": transcript_id, "p_minutes_artifact_id": artifact_id,
+                "p_member_id": m["id"], "p_items": suggested})
+
+        return {
+            "minutes_artifact_id": artifact_id, "state": "drafted", "style": style,
+            "decision_count": len(decisions), "action_item_count": len(actions),
+            "suggested_count": len(suggested), "engine": engine.name,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"[minutes] failed for recording {recording_id}: {e}")
+        raise HTTPException(status_code=502, detail="Minutes generation failed")
+
+
+@app.get("/rtc/minutes")
+def rtc_minutes_read(recording_id: str, authorization: str = Header(default="")):
+    """Read back the minutes draft + decisions + action items (explicit + suggested)."""
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    tr = _completed_transcript_for(client, recording_id)
+    if not tr:
+        raise HTTPException(status_code=404, detail="No completed transcript for this recording")
+    # membership gate
+    if not (client.table("room_members").select("id")
+            .eq("room_id", tr["room_id"]).eq("member_id", m["id"]).limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    transcript_id = tr["id"]
+
+    art_rows = (client.table("ai_artifacts")
+                .select("id, state, ai_draft, edited_text, approved_text, ai_engine_version")
+                .eq("source_transcript_id", transcript_id).eq("artifact_type", "meeting_minutes")
+                .neq("state", "discarded").order("created_at", desc=True).limit(1).execute().data) or []
+    art = art_rows[0] if art_rows else None
+
+    decisions = (client.table("meeting_decisions").select("seq, text")
+                 .eq("transcript_id", transcript_id).order("seq").execute().data) or []
+    actions = (client.table("meeting_action_items")
+               .select("seq, text, owner_hint, due_hint, status, kind, owner_member_id, promoted_at")
+               .eq("transcript_id", transcript_id).order("seq").execute().data) or []
+
+    return {
+        "minutes": art,
+        "decisions": decisions,
+        "action_items": [a for a in actions if a.get("kind") == "explicit"],
+        "suggested_action_items": [a for a in actions if a.get("kind") == "suggested"],
+    }
