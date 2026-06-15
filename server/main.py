@@ -54,6 +54,9 @@ OPERATOR_API_KEY = os.environ.get("OPERATOR_API_KEY", "")
 # engages if ALL of these (plus LiveKit) are set; otherwise calls run normally,
 # just without server-side recording.
 RECORDINGS_BUCKET = os.environ.get("RECORDINGS_BUCKET", "meeting-recordings")
+# 'per_track' (default): each participant's audio -> own file, exact attribution.
+# 'composite': legacy single mixed file (kept as fallback).
+RECORDING_MODE = os.environ.get("RECORDING_MODE", "per_track")
 SUPABASE_S3_ENDPOINT = os.environ.get("SUPABASE_S3_ENDPOINT", "")
 SUPABASE_S3_REGION = os.environ.get("SUPABASE_S3_REGION", "")
 SUPABASE_S3_ACCESS_KEY = os.environ.get("SUPABASE_S3_ACCESS_KEY", "")
@@ -85,7 +88,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.14.0")
+app = FastAPI(title="NanoHab Connect API", version="0.15.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -697,6 +700,18 @@ def _lk_api():
     return livekit_api.LiveKitAPI(LIVEKIT_HTTP_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
 
 
+def _s3_upload():
+    """Supabase S3-compatible upload target (shared by composite + per-track)."""
+    return livekit_api.S3Upload(
+        bucket=RECORDINGS_BUCKET,
+        region=SUPABASE_S3_REGION,
+        access_key=SUPABASE_S3_ACCESS_KEY,
+        secret=SUPABASE_S3_SECRET_KEY,
+        endpoint=SUPABASE_S3_ENDPOINT,
+        force_path_style=True,
+    )
+
+
 def _start_audio_egress(room_name: str, object_key: str) -> str:
     """Start a room-composite audio-only egress to the recordings bucket;
     return the LiveKit egress id."""
@@ -709,14 +724,7 @@ def _start_audio_egress(room_name: str, object_key: str) -> str:
                 file_outputs=[livekit_api.EncodedFileOutput(
                     file_type=livekit_api.EncodedFileType.OGG,
                     filepath=object_key,
-                    s3=livekit_api.S3Upload(
-                        bucket=RECORDINGS_BUCKET,
-                        region=SUPABASE_S3_REGION,
-                        access_key=SUPABASE_S3_ACCESS_KEY,
-                        secret=SUPABASE_S3_SECRET_KEY,
-                        endpoint=SUPABASE_S3_ENDPOINT,
-                        force_path_style=True,
-                    ),
+                    s3=_s3_upload(),
                 )],
             )
             info = await lk.egress.start_room_composite_egress(req)
@@ -756,9 +764,89 @@ def _ensure_room(room_name: str) -> None:
     asyncio.run(_run())
 
 
+# --- per-track egress (B4 P2) ------------------------------------------------
+def _identity_from_path(path: str):
+    """The publisher identity (= member id) lives in its own '/p_<identity>/'
+    path segment, so attribution is an unambiguous parse — no diarization."""
+    for seg in (path or "").split("/"):
+        if seg.startswith("p_"):
+            return seg[2:]
+    return None
+
+
+def _trackid_from_path(path: str):
+    for seg in (path or "").split("/"):
+        if seg.startswith("t_"):
+            return seg[2:].split(".")[0]
+    return None
+
+
+def _ensure_room_with_track_egress(room_name: str, prefix: str) -> None:
+    """Recreate the room with AUTO TRACK egress so each participant's audio is
+    recorded to its own file as it is published. The filepath template puts the
+    publisher identity (member id) in its own path segment for clean attribution.
+
+    Auto-egress config is fixed at room creation, so we delete+recreate to
+    guarantee fresh per-session config. Safe because this runs at go-live BEFORE
+    any participant connects (the client joins only after /rtc/start returns)."""
+    template = prefix + "/p_{publisher_identity}/t_{track_id}"
+    async def _run() -> None:
+        lk = _lk_api()
+        try:
+            try:
+                await lk.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+            except Exception:
+                pass  # room may not exist yet
+            await lk.room.create_room(livekit_api.CreateRoomRequest(
+                name=room_name, empty_timeout=300,
+                egress=livekit_api.RoomEgress(
+                    tracks=livekit_api.AutoTrackEgress(filepath=template, s3=_s3_upload()),
+                ),
+            ))
+        finally:
+            await lk.aclose()
+    asyncio.run(_run())
+
+
+def _list_room_egresses(room_name: str):
+    """List a room's egresses as plain dicts. Defensive getattr throughout — the
+    EgressInfo shape varies by SDK/egress type; we read file_results for the
+    object key + duration and parse identity/track from the templated path."""
+    async def _run():
+        lk = _lk_api()
+        out = []
+        try:
+            resp = await lk.egress.list_egress(
+                livekit_api.ListEgressRequest(room_name=room_name))
+            for info in (getattr(resp, "items", None) or []):
+                fname, dur_ns = None, None
+                fr = getattr(info, "file_results", None) or []
+                if fr:
+                    fname = getattr(fr[0], "filename", None) or getattr(fr[0], "location", None)
+                    dur_ns = getattr(fr[0], "duration", None)
+                out.append({
+                    "egress_id": getattr(info, "egress_id", None),
+                    "status": int(getattr(info, "status", 0) or 0),  # 1/2 active-ish, 3 complete
+                    "filename": fname,
+                    "duration_s": int(dur_ns / 1e9) if dur_ns else None,
+                    "identity": _identity_from_path(fname),
+                    "track_id": _trackid_from_path(fname),
+                })
+        finally:
+            await lk.aclose()
+        return out
+    return asyncio.run(_run())
+
+
+def _session_room(client, session_id: str) -> str:
+    rows = (client.table("live_sessions").select("livekit_room")
+            .eq("id", session_id).limit(1).execute().data) or []
+    return (rows[0].get("livekit_room") if rows else None) or session_id
+
+
 def _active_recording(client, session_id: str):
     rows = (client.table("meeting_recordings")
-            .select("id, egress_id, created_at")
+            .select("id, egress_id, recording_mode, created_at")
             .eq("live_session_id", session_id)
             .eq("status", "active")
             .limit(1).execute().data) or []
@@ -766,17 +854,37 @@ def _active_recording(client, session_id: str):
 
 
 def _maybe_start_recording(client, session: dict, member_id: str) -> str:
-    """Best-effort: start egress for a recording-enabled session and log the row.
-    Returns 'started' | 'already' | 'off' | 'failed' for the response."""
+    """Best-effort: start recording for a recording-enabled session and log the
+    row. Returns 'started' | 'already' | 'off' | 'failed'.
+
+    per_track (default): recreate the room with auto track-egress (each
+    participant -> own file); the parent row carries no single egress_id.
+    composite (fallback): start one room-composite egress."""
     if not isinstance(session, dict) or not session.get("recording_enabled"):
         return "off"
     if not _recordings_configured():
         return "off"
     session_id = session["id"]
     room_name = session.get("livekit_room") or session_id
+    mode = RECORDING_MODE if RECORDING_MODE in ("composite", "per_track") else "composite"
     try:
         if _active_recording(client, session_id):
-            return "already"  # idempotent: a second joiner must not start a 2nd egress
+            return "already"  # idempotent: a second joiner must not start again
+
+        if mode == "per_track":
+            prefix = f"{room_name}/{session_id}"
+            _ensure_room_with_track_egress(room_name, prefix)
+            _rpc_quiet(client, "svc_start_recording", {
+                "p_session_id": session_id,
+                "p_member_id": member_id,
+                "p_egress_id": None,
+                "p_mode": "per_track",
+                "p_bucket": RECORDINGS_BUCKET,
+                "p_path": prefix,
+            })
+            return "started"
+
+        # composite fallback
         object_key = f"{room_name}/{session_id}.ogg"
         _ensure_room(room_name)
         egress_id = _start_audio_egress(room_name, object_key)
@@ -795,32 +903,51 @@ def _maybe_start_recording(client, session: dict, member_id: str) -> str:
 
 
 def _maybe_stop_recording(client, session_id: str) -> str:
-    """Best-effort: stop the active egress for a session and close out its row.
-    Returns 'stopped' | 'none' | 'failed'."""
+    """Best-effort: stop a session's recording and close out its row.
+    Returns 'stopped' | 'none' | 'failed'.
+
+    per_track: stop any still-active track egresses for the room, then finish the
+    parent. The per-track FILES are written to recording_tracks by the reconcile
+    step (timing: files finalize asynchronously after stop).
+    composite: stop the single egress and finish."""
     rec = _active_recording(client, session_id)
     if not rec:
         return "none"
-    try:
-        _stop_egress(rec["egress_id"])
-        # Approximate the duration from the row's lifetime; the file's exact
-        # length is filled by the egress webhook later (B4 hardening).
-        dur = None
+    mode = rec.get("recording_mode") or "composite"
+
+    def _approx_dur():
         try:
             created = datetime.fromisoformat(str(rec["created_at"]).replace("Z", "+00:00"))
-            dur = max(1, int((datetime.now(timezone.utc) - created).total_seconds()))
+            return max(1, int((datetime.now(timezone.utc) - created).total_seconds()))
         except Exception:
-            dur = None
+            return None
+
+    try:
+        if mode == "per_track":
+            room_name = _session_room(client, session_id)
+            try:
+                for e in _list_room_egresses(room_name):
+                    if e["egress_id"] and e["status"] in (0, 1, 2):  # starting/active/ending
+                        try:
+                            _stop_egress(e["egress_id"])
+                        except Exception:
+                            pass
+            except Exception as ex:
+                print(f"[rec] per_track stop-list failed for {session_id}: {ex}")
+            _rpc_quiet(client, "svc_finish_recording", {
+                "p_recording_id": rec["id"], "p_status": "completed",
+                "p_duration": _approx_dur(), "p_path": None, "p_error": None,
+            })
+            return "stopped"
+
+        # composite
+        _stop_egress(rec["egress_id"])
         _rpc_quiet(client, "svc_finish_recording", {
-            "p_recording_id": rec["id"],
-            "p_status": "completed",
-            "p_duration": dur,
-            "p_path": None,
-            "p_error": None,
+            "p_recording_id": rec["id"], "p_status": "completed",
+            "p_duration": _approx_dur(), "p_path": None, "p_error": None,
         })
         return "stopped"
     except Exception as e:
-        # Leave the row 'active' for a later webhook/reconcile rather than
-        # mislabel it; log loudly so a lingering egress gets noticed.
         print(f"[rec] stop failed for session {session_id}: {e}")
         return "failed"
 
@@ -865,6 +992,73 @@ def rtc_end(session_id: str, authorization: str = Header(default="")):
     })
     rec_status = _maybe_stop_recording(client, session_id)
     return {"session": data, "recording": rec_status}
+
+
+@app.post("/rtc/reconcile-tracks")
+def rtc_reconcile_tracks(recording_id: str, authorization: str = Header(default="")):
+    """
+    For a per_track recording, list the room's egresses and write each finalized
+    track file into recording_tracks (idempotent upsert via svc_record_track).
+    Attribution comes from the templated path ('/p_<member-id>/'), not diarization.
+
+    Call AFTER /rtc/end and a short wait (track files finalize asynchronously).
+    Re-runnable; tracks still finalizing come back with status 'active' and can be
+    reconciled again later. This also seeds B4b' per-track transcription.
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+
+    rows = (client.table("meeting_recordings")
+            .select("id, live_session_id, room_id, recording_mode")
+            .eq("id", recording_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No such recording")
+    rec = rows[0]
+    if not (client.table("room_members").select("id")
+            .eq("room_id", rec["room_id"]).eq("member_id", m["id"]).limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    if (rec.get("recording_mode") or "composite") != "per_track":
+        raise HTTPException(status_code=400, detail="Not a per_track recording")
+
+    session_id = rec["live_session_id"]
+    room_name = _session_room(client, session_id)
+    prefix = f"{room_name}/{session_id}"
+
+    found, tracks = 0, []
+    for e in _list_room_egresses(room_name):
+        fname = e.get("filename")
+        if not fname or prefix not in fname:
+            continue  # only this session's per-track files
+        found += 1
+        st = e["status"]
+        status = "completed" if st == 3 else ("failed" if st in (4, 5) else "active")
+        row = _rpc_quiet(client, "svc_record_track", {
+            "p_recording_id": recording_id,
+            "p_member_id": m["id"],
+            "p_participant_identity": e.get("identity"),
+            "p_egress_id": e.get("egress_id"),
+            "p_track_id": e.get("track_id"),
+            "p_bucket": RECORDINGS_BUCKET,
+            "p_path": fname,
+            "p_status": status,
+            "p_duration": e.get("duration_s"),
+            "p_error": None,
+        })
+        resolved = None
+        if isinstance(row, list) and row:
+            resolved = row[0].get("member_id")
+        elif isinstance(row, dict):
+            resolved = row.get("member_id")
+        tracks.append({
+            "identity": e.get("identity"),
+            "member_id": resolved,
+            "egress_id": e.get("egress_id"),
+            "path": fname,
+            "status": status,
+            "duration_s": e.get("duration_s"),
+        })
+
+    return {"recording_id": recording_id, "tracks_found": found, "tracks": tracks}
 
 
 @app.post("/rtc/consent")
