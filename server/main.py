@@ -35,7 +35,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
 from livekit import api as livekit_api
@@ -298,6 +298,287 @@ def rtc_token(room_id: str, authorization: str = Header(default="")):
 # exists in their room). Reusable until expiry; revoke + consent-gate +
 # session-window are the real guards. Single-use is a documented fast-follow.
 # ============================================================================
+
+# ============================================================================
+# B5 / M2 — Thread media: member-authed upload + secure signed-download.
+#
+# Paste this block into server/main.py (anywhere after resolve_member /
+# get_service_client / _rpc are defined, e.g. just before the guest section).
+# It is self-contained except for ONE module-level import addition (see the
+# deploy notes): File, Form, UploadFile must be added to the fastapi import.
+#
+# Design (matches the M1 DB + the B5 design doc):
+#   POST /thread/attach                 (member; multipart)
+#     resolve member -> read bytes -> SNIFF magic bytes (not the client MIME)
+#     -> allowlist + per-type size cap + soft rate cap -> for images: re-encode
+#     via Pillow to STRIP EXIF/GPS -> upload to the private message-attachments
+#     bucket under a random (non-PHI) path -> svc_record_attachment (records
+#     exif_stripped truthfully, scan_status='pending') -> run the scan hook ->
+#     svc_set_scan_status. Returns the attachment id + final scan_status.
+#   GET  /thread/attachment/{id}        (member)
+#     resolve member -> read row (service role) -> GATE on membership AND
+#     scan_status='clean' -> mint a short-TTL signed URL. Never serves bytes
+#     directly; never serves a non-clean file.
+#
+# Why the backend, not RLS: guests/operators aside, even members download via
+# the backend here so the scan-gate + signed-URL TTL live in one enforced place
+# (the read RLS policy only governs the metadata row, not the bytes).
+# ============================================================================
+
+import io as _io
+import json as _json
+import secrets as _secrets
+from datetime import datetime as _dt, timezone as _tz
+
+ATTACH_BUCKET = "message-attachments"
+
+# Allowlist keyed by the kind we detect from MAGIC BYTES. Each entry pins the
+# canonical stored MIME, the stored file extension, the category, and the
+# per-type size cap (bytes). The client-sent filename/MIME is NEVER trusted.
+_ATTACH_RULES = {
+    "png":  {"mime": "image/png",  "ext": ".png", "cat": "image", "cap": 15 * 1024 * 1024},
+    "jpeg": {"mime": "image/jpeg", "ext": ".jpg", "cat": "image", "cap": 15 * 1024 * 1024},
+    "heic": {"mime": "image/jpeg", "ext": ".jpg", "cat": "image", "cap": 15 * 1024 * 1024},  # transcoded -> jpeg
+    "pdf":  {"mime": "application/pdf", "ext": ".pdf", "cat": "pdf", "cap": 25 * 1024 * 1024},
+    "m4a":  {"mime": "audio/mp4",  "ext": ".m4a", "cat": "audio", "cap": 25 * 1024 * 1024},
+    "mp3":  {"mime": "audio/mpeg", "ext": ".mp3", "cat": "audio", "cap": 25 * 1024 * 1024},
+    "wav":  {"mime": "audio/wav",  "ext": ".wav", "cat": "audio", "cap": 25 * 1024 * 1024},
+    "ogg":  {"mime": "audio/ogg",  "ext": ".ogg", "cat": "audio", "cap": 25 * 1024 * 1024},
+}
+_ATTACH_HARD_CEILING = 25 * 1024 * 1024     # reject before any work if larger than the biggest cap
+_ATTACH_RATE_PER_HOUR = 60                  # soft per-uploader cap
+
+# Pluggable scanner seam. 'stub_clean' marks everything clean (dev/headless);
+# swap to a real ClamAV sidecar / private scanning API later WITHOUT touching
+# the gate or the endpoints — only _run_scan changes.
+SCANNER_MODE = os.environ.get("SCANNER_MODE", "stub_clean")
+
+
+def _attach_log(action: str, **fields):
+    """Structured, PHI-free audit line (Cloud Run captures stdout). Deliberately
+    omits original_name and bytes — only ids, sizes, types, results. Stand-in
+    until the dedicated audit_events table lands (flagged fast-follow)."""
+    rec = {"evt": "attachment", "action": action,
+           "at": _dt.now(_tz.utc).isoformat()}
+    rec.update(fields)
+    print(_json.dumps(rec, ensure_ascii=False), flush=True)
+
+
+def _sniff_attachment_kind(b: bytes) -> str | None:
+    """Identify the file from its leading bytes. Returns an _ATTACH_RULES key
+    or None if it's not on the allowlist. Magic-byte sniffing beats a client
+    Content-Type, which is trivially spoofed."""
+    if len(b) < 12:
+        return None
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if b[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if b[:5] == b"%PDF-":
+        return "pdf"
+    if b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return "wav"
+    if b[:4] == b"OggS":
+        return "ogg"
+    if b[:3] == b"ID3" or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0):   # ID3 or MPEG frame sync
+        return "mp3"
+    if b[4:8] == b"ftyp":                                            # ISO-BMFF container
+        brand = b[8:12]
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1", b"hevc", b"hevx"):
+            return "heic"
+        if brand in (b"M4A ", b"M4B ", b"mp42", b"isom", b"iso2", b"mp41"):
+            return "m4a"
+    return None
+
+
+def _strip_image_to_bytes(raw: bytes, kind: str) -> bytes:
+    """Re-encode an image so NO original metadata survives (EXIF, GPS, maker
+    notes are simply not carried into the new file). HEIC is transcoded to JPEG
+    for universal viewability + a guaranteed strip. Deferred import: a missing
+    Pillow/pillow-heif degrades to a clear error on the image path only, never
+    a server boot crash."""
+    from PIL import Image
+    if kind == "heic":
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    img = Image.open(_io.BytesIO(raw))
+    out = _io.BytesIO()
+    if kind == "png":
+        img.save(out, format="PNG", optimize=True)          # no exif kwarg -> dropped
+    else:                                                   # jpeg + heic -> jpeg
+        img.convert("RGB").save(out, format="JPEG", quality=88, optimize=True)
+    return out.getvalue()
+
+
+def _run_scan(raw: bytes) -> str:
+    """Return a scan verdict in the CHECK set: 'clean'|'infected'|'error'.
+    The real engine slots in here; for now stub-clean keeps the gate genuine
+    and headless-testable end to end."""
+    if SCANNER_MODE == "stub_clean":
+        return "clean"
+    # TODO(scanner): ClamAV sidecar / private API. On a real failure return 'error'.
+    return "clean"
+
+
+def _attachment_signed_url(client, bucket: str, path: str, expires_seconds: int = 300):
+    """Mint a short-TTL signed URL (mirrors _signed_audio_url's key/prefix
+    handling). The URL is a time-boxed read capability; we never log or store
+    it — only hand it to the caller for immediate use."""
+    res = client.storage.from_(bucket).create_signed_url(path, expires_seconds)
+    url = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
+    if not url:
+        raise RuntimeError("could not mint signed url")
+    if url.startswith("/"):
+        url = SUPABASE_URL.rstrip("/") + "/storage/v1" + url
+    return url
+
+
+@app.post("/thread/attach")
+def thread_attach(
+    message_id: str = Form(...),
+    room_id: str = Form(...),
+    is_clinical: bool = Form(True),
+    file: UploadFile = File(...),
+    authorization: str = Header(default=""),
+):
+    """Member uploads a file onto an existing message in their room. The message
+    is created client-side (RLS); this endpoint validates, strips, stores, and
+    records it. svc_record_attachment re-checks membership + that the message
+    belongs to the room, so the tie-on can't be forged."""
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    # Soft rate cap — count this uploader's recent rows (service-role read).
+    try:
+        since = (_dt.now(_tz.utc).timestamp()) - 3600
+        recent = (client.table("attachments")
+                  .select("id, created_at")
+                  .eq("uploaded_by", member_id)
+                  .gte("created_at", _dt.fromtimestamp(since, _tz.utc).isoformat())
+                  .execute().data) or []
+        if len(recent) >= _ATTACH_RATE_PER_HOUR:
+            raise HTTPException(status_code=429, detail="Upload rate limit reached; try again later")
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 — never let the rate check itself block a legit upload
+        pass
+
+    raw = file.file.read()
+    size = len(raw)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if size > _ATTACH_HARD_CEILING:
+        raise HTTPException(status_code=413, detail="File exceeds the maximum allowed size")
+
+    kind = _sniff_attachment_kind(raw)
+    if not kind:
+        raise HTTPException(status_code=415, detail="Unsupported or unrecognised file type")
+    rule = _ATTACH_RULES[kind]
+    if size > rule["cap"]:
+        mb = rule["cap"] // (1024 * 1024)
+        raise HTTPException(status_code=413, detail=f"{rule['cat']} files are limited to {mb} MB")
+
+    # Images: strip metadata by re-encoding. pdf/audio stored as-is (exif_stripped
+    # stays false — honest; pdf/audio metadata scrubbing is a later enhancement).
+    exif_stripped = False
+    body = raw
+    if rule["cat"] == "image":
+        try:
+            body = _strip_image_to_bytes(raw, kind)
+            exif_stripped = True
+            size = len(body)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail=f"Could not process image: {e}")
+
+    # Random, non-PHI storage path. The display name lives in the DB row
+    # (RLS-protected), never in the object path.
+    storage_path = f"{room_id}/{_secrets.token_hex(16)}{rule['ext']}"
+    try:
+        client.storage.from_(ATTACH_BUCKET).upload(
+            storage_path, body,
+            {"content-type": rule["mime"], "upsert": "false"},
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+
+    row = _rpc(client, "svc_record_attachment", {
+        "p_message_id": message_id,
+        "p_room_id": room_id,
+        "p_uploaded_by": member_id,
+        "p_storage_path": storage_path,
+        "p_mime_type": rule["mime"],
+        "p_size_bytes": size,
+        "p_original_name": (file.filename or None),
+        "p_is_clinical": bool(is_clinical),
+        "p_storage_bucket": ATTACH_BUCKET,
+        "p_exif_stripped": exif_stripped,
+    })
+    if isinstance(row, list):
+        row = row[0] if row else None
+    if not row or not row.get("id"):
+        # Record failed (e.g. not a room member / message not in room) -> the
+        # svc raises 42501; surface as 403 and clean up the orphaned object.
+        try:
+            client.storage.from_(ATTACH_BUCKET).remove([storage_path])
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=403, detail="Not permitted to attach to this message")
+    attachment_id = row["id"]
+
+    # Scan, then set status (the download gate keys off this).
+    verdict = _run_scan(body)
+    _rpc(client, "svc_set_scan_status", {
+        "p_attachment_id": attachment_id, "p_scan_status": verdict,
+    })
+
+    _attach_log("upload", attachment_id=attachment_id, room_id=room_id,
+                member_id=member_id, kind=kind, mime=rule["mime"],
+                size=size, exif_stripped=exif_stripped, scan=verdict)
+
+    return {"id": attachment_id, "scan_status": verdict, "mime_type": rule["mime"],
+            "size_bytes": size, "exif_stripped": exif_stripped}
+
+
+@app.get("/thread/attachment/{attachment_id}")
+def thread_attachment_download(
+    attachment_id: str,
+    authorization: str = Header(default=""),
+):
+    """Mint a short-TTL signed URL for a member to fetch an attachment — only if
+    they're a member of its room AND the file scanned clean."""
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    rows = (client.table("attachments")
+            .select("id, room_id, storage_bucket, storage_path, mime_type, scan_status")
+            .eq("id", attachment_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    att = rows[0]
+
+    # Gate 1 — membership (explicit; service role bypasses RLS).
+    is_member = (client.table("room_members")
+                 .select("member_id")
+                 .eq("room_id", att["room_id"]).eq("member_id", member_id)
+                 .limit(1).execute().data) or []
+    if not is_member:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # Gate 2 — scan state.
+    st = att.get("scan_status")
+    if st == "infected":
+        raise HTTPException(status_code=403, detail="This file failed a safety scan and cannot be downloaded")
+    if st != "clean":
+        raise HTTPException(status_code=409, detail="File is still being processed; try again shortly")
+
+    url = _attachment_signed_url(client, att.get("storage_bucket") or ATTACH_BUCKET,
+                                 att["storage_path"], 300)
+    _attach_log("download", attachment_id=attachment_id, room_id=att["room_id"],
+                member_id=member_id, mime=att.get("mime_type"))
+    return {"url": url, "expires_in": 300, "mime_type": att.get("mime_type")}
+
 
 def _token_hash(raw: str) -> str:
     return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
