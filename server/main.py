@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.21.0")
+app = FastAPI(title="NanoHab Connect API", version="0.22.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -913,7 +913,13 @@ def _artifact_audio_path(client, artifact_id: str) -> str:
 
 def _download_audio(client, artifact_id: str) -> bytes:
     """Fast path: pull the audio bytes from the private bucket (service role)."""
-    return client.storage.from_("voice-notes").download(_artifact_audio_path(client, artifact_id))
+    return client.storage.from_(_artifact_audio_bucket(client, artifact_id)).download(_artifact_audio_path(client, artifact_id))
+
+
+def _artifact_audio_bucket(client, artifact_id: str) -> str:
+    rows = (client.table("ai_artifacts").select("audio_bucket")
+            .eq("id", artifact_id).limit(1).execute().data) or []
+    return (rows[0].get("audio_bucket") if rows else None) or "voice-notes"
 
 
 def _signed_audio_url(client, artifact_id: str, expires_seconds: int = 1800):
@@ -921,7 +927,7 @@ def _signed_audio_url(client, artifact_id: str, expires_seconds: int = 1800):
     time-boxed read capability; we return it for immediate use and record only
     its EXPIRY in the DB — never the URL itself."""
     path = _artifact_audio_path(client, artifact_id)
-    res = client.storage.from_("voice-notes").create_signed_url(path, expires_seconds)
+    res = client.storage.from_(_artifact_audio_bucket(client, artifact_id)).create_signed_url(path, expires_seconds)
     url = res.get("signedURL") or res.get("signedUrl") or res.get("signed_url")
     if not url:
         raise RuntimeError("could not mint signed url")
