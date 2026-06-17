@@ -2168,3 +2168,27 @@ def rtc_action_item_owner(action_item_id: str, owner_member_id: str = "",
         "p_action_item_id": action_item_id, "p_member_id": m["id"],
         "p_owner_member_id": _none_if_blank(owner_member_id)})
     return {"action_item": row}
+
+
+# ============================================================================
+# Stage B3 - guest invitation revoke (HTTP wrapper around svc_revoke_guest_invitation).
+# Mirrors /rtc/end: authenticate the member from their bearer token, then call
+# the service-role RPC that does the authorization (caller must be a member of
+# the invitation's room) and the atomic write, in one place. After this, the
+# token resolves as unusable and /guest/livekit-token refuses to mint.
+# ============================================================================
+@app.post("/rtc/revoke-guest")
+def rtc_revoke_guest(invitation_id: str, authorization: str = Header(default="")):
+    """
+    Revoke a guest magic link. The verified caller must be a member of the
+    invitation's room (enforced inside svc_revoke_guest_invitation). The member
+    app's "revoke link" button calls this. Safe to call on an already-revoked
+    invite. Returns whatever the RPC returns under "revoked".
+    """
+    m = resolve_member(authorization)
+    client = get_service_client()
+    data = _rpc(client, "svc_revoke_guest_invitation", {
+        "p_invitation_id": invitation_id,
+        "p_member_id": m["id"],
+    })
+    return {"revoked": data}
