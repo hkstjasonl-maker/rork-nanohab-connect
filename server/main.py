@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.26.0")
+app = FastAPI(title="NanoHab Connect API", version="0.26.1")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -2762,7 +2762,7 @@ class SpeechSynthesizer:
             f"</voice></speak>"
         )
         url = f"https://{self.region}.tts.speech.microsoft.com/cognitiveservices/v1"
-        resp = requests.post(
+        resp = httpx.post(
             url,
             headers={
                 "Ocp-Apim-Subscription-Key": self.key,
@@ -2770,7 +2770,7 @@ class SpeechSynthesizer:
                 "X-Microsoft-OutputFormat": _TTS_OUTPUT_FORMAT,
                 "User-Agent": "nanohab-connect",
             },
-            data=ssml.encode("utf-8"),
+            content=ssml.encode("utf-8"),
             timeout=30,
         )
         resp.raise_for_status()
