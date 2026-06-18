@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.22.0")
+app = FastAPI(title="NanoHab Connect API", version="0.23.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -2479,3 +2479,144 @@ def rtc_revoke_guest(invitation_id: str, authorization: str = Header(default="")
         "p_member_id": m["id"],
     })
     return {"revoked": data}
+
+
+# ============================================================================
+# B5 / M5 — Translate a transcript into a reviewable, in-region draft.
+#
+# APPEND this whole block to the END of server/main.py. It is self-contained:
+# every name it uses (app, Header, HTTPException, httpx, os, resolve_member,
+# get_service_client, _rpc) is defined earlier in the file, and it adds NO new
+# imports or dependencies.
+#
+# Synchronous by design: text translation returns in well under a request, so
+# (unlike batch audio) there's no queue/worker — the clinician gets the draft
+# immediately. The result lands as a 'drafted' attachment_translation artifact
+# tied to the same message, original kept alongside, with a machine-translation
+# disclaimer; it carries no clinical weight until a clinician approves it.
+#
+# Engine seam mirrors FastTranscriber/FakeFast: real AzureTranslator when the
+# key is set, FakeTranslator otherwise — so this proves end-to-end now and the
+# real in-region engine drops in the moment AZURE_TRANSLATOR_KEY is configured.
+# ============================================================================
+
+# Default to the Asia-Pacific regional host so data stays in-region (pair with a
+# Translator resource created in southeastasia + the matching region header).
+AZURE_TRANSLATOR_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "")
+AZURE_TRANSLATOR_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "southeastasia")
+AZURE_TRANSLATOR_ENDPOINT = os.environ.get(
+    "AZURE_TRANSLATOR_ENDPOINT", "https://api-apc.cognitive.microsofttranslator.com")
+
+_MT_DISCLAIMER = ("Machine translation — provided for coordination only and not a "
+                  "substitute for a qualified interpreter. The original text is shown "
+                  "alongside; a clinician must review before this is relied upon.")
+
+
+class AzureTranslator:
+    name = "azure_translator_v1"
+
+    def __init__(self, key: str, region: str, endpoint: str, api_version: str = "3.0"):
+        self.key, self.region = key, region
+        self.base = (endpoint or "https://api-apc.cognitive.microsofttranslator.com").rstrip("/")
+        self.api_version = api_version
+
+    def translate(self, text: str, to_lang: str, from_lang: str = ""):
+        url = f"{self.base}/translate?api-version={self.api_version}&to={to_lang}"
+        if from_lang:
+            url += f"&from={from_lang}"
+        headers = {"Ocp-Apim-Subscription-Key": self.key, "Content-Type": "application/json"}
+        if self.region:
+            headers["Ocp-Apim-Subscription-Region"] = self.region
+        r = httpx.post(url, headers=headers, json=[{"Text": text}], timeout=60)
+        r.raise_for_status()
+        item = r.json()[0]
+        translated = item["translations"][0]["text"]
+        detected = (item.get("detectedLanguage") or {}).get("language")
+        return translated, detected
+
+
+class FakeTranslator:
+    name = "fake_translator_v0"
+
+    def translate(self, text: str, to_lang: str, from_lang: str = ""):
+        # Deterministic, obviously-fake output so tests prove the wiring without
+        # an Azure key (and so a fake draft is never mistaken for a real one).
+        return f"[{to_lang}] {text}", (from_lang or "und")
+
+
+def get_translator():
+    if AZURE_TRANSLATOR_KEY:
+        return AzureTranslator(AZURE_TRANSLATOR_KEY, AZURE_TRANSLATOR_REGION, AZURE_TRANSLATOR_ENDPOINT)
+    return FakeTranslator()
+
+
+def _member_default_lang(client, member_id: str) -> str:
+    """Seed the target from the requester's stored language; fall back to English
+    so a missing/empty languages array never fails the request."""
+    try:
+        rows = (client.table("members").select("languages")
+                .eq("id", member_id).limit(1).execute().data) or []
+        langs = (rows[0].get("languages") if rows else None) or []
+        return langs[0] if langs else "en"
+    except Exception:  # noqa: BLE001
+        return "en"
+
+
+@app.post("/thread/transcript/{artifact_id}/translate")
+def thread_translate(artifact_id: str, target: str = "", authorization: str = Header(default="")):
+    """Translate a transcript artifact into `target` (default: the requester's
+    stored language, else English). Returns a 'drafted' translation artifact with
+    the original alongside. Idempotent per (source, target)."""
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    rows = (client.table("ai_artifacts")
+            .select("id, room_id, transcript, artifact_type, state, posted_message_id")
+            .eq("id", artifact_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Transcript artifact not found")
+    src = rows[0]
+
+    # Membership gate (explicit; service role bypasses RLS).
+    if not (client.table("room_members").select("member_id")
+            .eq("room_id", src["room_id"]).eq("member_id", member_id)
+            .limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    source_text = (src.get("transcript") or "").strip()
+    if not source_text:
+        raise HTTPException(status_code=409, detail="This artifact has no transcript text to translate yet")
+
+    tgt = (target or "").strip() or _member_default_lang(client, member_id)
+
+    translator = get_translator()
+    try:
+        translated, detected = translator.translate(source_text, tgt)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Translation engine failed: {e}")
+
+    row = _rpc(client, "svc_create_attachment_translation", {
+        "p_source_artifact_id": artifact_id,
+        "p_member_id": member_id,
+        "p_target_language": tgt,
+        "p_draft": translated,
+        "p_engine_version": translator.name,
+    })
+    if isinstance(row, list):
+        row = row[0] if row else None
+    if not row or not row.get("id"):
+        raise HTTPException(status_code=403, detail="Not permitted to translate this transcript")
+
+    return {
+        "translation_artifact_id": row["id"],
+        "source_artifact_id": artifact_id,
+        "target_language": row.get("target_language") or tgt,
+        "detected_source": detected,
+        "engine": translator.name,
+        "state": row.get("state"),
+        "original": source_text,
+        "translation": row.get("ai_draft") or translated,
+        "disclaimer": _MT_DISCLAIMER,
+    }
+
