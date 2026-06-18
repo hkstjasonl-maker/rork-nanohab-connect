@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.23.0")
+app = FastAPI(title="NanoHab Connect API", version="0.24.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -2617,6 +2617,65 @@ def thread_translate(artifact_id: str, target: str = "", authorization: str = He
         "state": row.get("state"),
         "original": source_text,
         "translation": row.get("ai_draft") or translated,
+        "disclaimer": _MT_DISCLAIMER,
+    }
+
+
+
+
+# ============================================================================
+# Theme 1 / message translation — long-press a text message -> translate.
+#
+# APPEND to the END of server/main.py (after the M5 translate block, which
+# defines get_translator / _member_default_lang / _MT_DISCLAIMER — all reused
+# here). Adds NO new imports or dependencies.
+#
+# Ephemeral by design: a text message is member-authored coordination text, not
+# a reviewable clinical artifact, so we translate and return inline rather than
+# persisting. (When audit_events lands, add one log call here.)
+# ============================================================================
+
+@app.post("/thread/message/{message_id}/translate")
+def thread_message_translate(
+    message_id: str, target: str = "", authorization: str = Header(default="")
+):
+    """Translate a single text message into `target` (default: the requester's
+    stored language, else English). Returns original + translation inline."""
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    rows = (client.table("messages")
+            .select("id, room_id, body")
+            .eq("id", message_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Message not found")
+    msg = rows[0]
+
+    # Membership gate (explicit; service role bypasses RLS).
+    if not (client.table("room_members").select("member_id")
+            .eq("room_id", msg["room_id"]).eq("member_id", member_id)
+            .limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    text = (msg.get("body") or "").strip()
+    if not text:
+        raise HTTPException(status_code=409, detail="This message has no text to translate")
+
+    tgt = (target or "").strip() or _member_default_lang(client, member_id)
+    translator = get_translator()
+    try:
+        translated, detected = translator.translate(text, tgt)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Translation engine failed: {e}")
+
+    return {
+        "message_id": message_id,
+        "target_language": tgt,
+        "detected_source": detected,
+        "engine": translator.name,
+        "original": text,
+        "translation": translated,
         "disclaimer": _MT_DISCLAIMER,
     }
 
