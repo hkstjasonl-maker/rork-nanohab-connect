@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.26.2")
+app = FastAPI(title="NanoHab Connect API", version="0.27.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -362,6 +362,40 @@ def _attach_log(action: str, **fields):
            "at": _dt.now(_tz.utc).isoformat()}
     rec.update(fields)
     print(_json.dumps(rec, ensure_ascii=False), flush=True)
+    try:
+        _audit(
+            get_service_client(),
+            actor_member_id=fields.get("member_id"),
+            action=("view" if action == "download" else action),
+            target_type="attachment",
+            target_id=fields.get("attachment_id"),
+            room_id=fields.get("room_id"),
+            mime_type=fields.get("mime"),
+            detail={k: v for k, v in fields.items()
+                    if k in ("size", "kind", "scan_status", "exif_stripped")},
+        )
+    except Exception:
+        pass
+
+
+def _audit(client, *, actor_member_id=None, action, target_type=None,
+           target_id=None, room_id=None, case_id=None, mime_type=None,
+           purpose=None, detail=None):
+    """Append one immutable row to audit_events. NEVER raises. detail = NON-PHI."""
+    try:
+        client.table("audit_events").insert({
+            "actor_member_id": actor_member_id,
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "room_id": room_id,
+            "case_id": case_id,
+            "mime_type": mime_type,
+            "purpose": purpose,
+            "detail": detail or {},
+        }).execute()
+    except Exception:
+        pass
 
 
 def _sniff_attachment_kind(b: bytes) -> str | None:
@@ -2676,6 +2710,10 @@ def thread_message_translate(
               .limit(1).execute().data) or []
     if cached:
         c = cached[0]
+        _audit(client, actor_member_id=member_id, action="translate",
+               target_type="message", target_id=message_id,
+               room_id=msg["room_id"],
+               detail={"target_language": tgt, "cached": True})
         return {
             "message_id": message_id,
             "target_language": tgt,
@@ -2709,6 +2747,10 @@ def thread_message_translate(
         # just computed is fine regardless of who won the race.
         pass
 
+    _audit(client, actor_member_id=member_id, action="translate",
+           target_type="message", target_id=message_id,
+           room_id=msg["room_id"],
+           detail={"target_language": tgt, "cached": False})
     return {
         "message_id": message_id,
         "target_language": tgt,
@@ -2840,5 +2882,8 @@ def thread_message_speak(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Speech synthesis failed: {e}")
 
+    _audit(client, actor_member_id=member_id, action="speak",
+           target_type="message", target_id=message_id,
+           room_id=msg["room_id"], detail={"lang": tgt or "en"})
     return Response(content=audio, media_type="audio/mpeg")
 
