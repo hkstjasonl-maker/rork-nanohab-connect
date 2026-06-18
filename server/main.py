@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.24.0")
+app = FastAPI(title="NanoHab Connect API", version="0.25.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -2640,7 +2640,12 @@ def thread_message_translate(
     message_id: str, target: str = "", authorization: str = Header(default="")
 ):
     """Translate a single text message into `target` (default: the requester's
-    stored language, else English). Returns original + translation inline."""
+    stored language, else English).
+
+    Get-or-create against the shared message_translations cache: the first reader
+    to request a given (message, language) pays the Azure call; every later reader
+    (including other family members) is served from cache for free. Caps cost at
+    <=3 translations per message, ever, shared across all readers."""
     m = resolve_member(authorization)
     member_id = m["id"]
     client = get_service_client()
@@ -2663,11 +2668,46 @@ def thread_message_translate(
         raise HTTPException(status_code=409, detail="This message has no text to translate")
 
     tgt = (target or "").strip() or _member_default_lang(client, member_id)
+
+    # 1) Cache hit? Return immediately — no engine call.
+    cached = (client.table("message_translations")
+              .select("translation, detected_source, engine")
+              .eq("message_id", message_id).eq("target_language", tgt)
+              .limit(1).execute().data) or []
+    if cached:
+        c = cached[0]
+        return {
+            "message_id": message_id,
+            "target_language": tgt,
+            "detected_source": c.get("detected_source"),
+            "engine": c.get("engine"),
+            "original": text,
+            "translation": c.get("translation"),
+            "disclaimer": _MT_DISCLAIMER,
+            "cached": True,
+        }
+
+    # 2) Miss -> translate, then store in the shared cache.
     translator = get_translator()
     try:
         translated, detected = translator.translate(text, tgt)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Translation engine failed: {e}")
+
+    try:
+        client.table("message_translations").insert({
+            "message_id": message_id,
+            "room_id": msg["room_id"],
+            "target_language": tgt,
+            "translation": translated,
+            "detected_source": detected,
+            "engine": translator.name,
+        }).execute()
+    except Exception:  # noqa: BLE001
+        # A concurrent writer may have inserted the same (message, target) first.
+        # The unique constraint protects integrity; serving the translation we
+        # just computed is fine regardless of who won the race.
+        pass
 
     return {
         "message_id": message_id,
@@ -2677,5 +2717,6 @@ def thread_message_translate(
         "original": text,
         "translation": translated,
         "disclaimer": _MT_DISCLAIMER,
+        "cached": False,
     }
 
