@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.25.0")
+app = FastAPI(title="NanoHab Connect API", version="0.26.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -2719,4 +2719,126 @@ def thread_message_translate(
         "disclaimer": _MT_DISCLAIMER,
         "cached": False,
     }
+
+
+
+
+# ============================================================================
+# Read-aloud (TTS) — speak a message in the reader's language.
+#
+# APPEND to the END of server/main.py. Reuses AZURE_SPEECH_KEY / _REGION (same
+# creds as transcription). Mirrors the engine-seam pattern: real Azure when the
+# key is set, fake otherwise. On-demand synthesis (not cached): audio is bulky
+# and speech is ephemeral.
+# ============================================================================
+import xml.sax.saxutils as _sax
+
+# lang code -> (xml:lang, neural voice). Overridable via env if you want other voices.
+_TTS_VOICES = {
+    "en":      (os.environ.get("TTS_VOICE_EN_LANG", "en-US"),
+                os.environ.get("TTS_VOICE_EN", "en-US-JennyNeural")),
+    "zh-Hant": (os.environ.get("TTS_VOICE_YUE_LANG", "zh-HK"),
+                os.environ.get("TTS_VOICE_YUE", "zh-HK-HiuMaanNeural")),   # Cantonese
+    "zh-Hans": (os.environ.get("TTS_VOICE_CMN_LANG", "zh-CN"),
+                os.environ.get("TTS_VOICE_CMN", "zh-CN-XiaoxiaoNeural")),  # Mandarin
+}
+_TTS_OUTPUT_FORMAT = os.environ.get(
+    "TTS_OUTPUT_FORMAT", "audio-24khz-48kbitrate-mono-mp3"
+)
+
+
+class SpeechSynthesizer:
+    name = "azure_tts_v1"
+
+    def __init__(self, key: str, region: str):
+        self.key, self.region = key, region
+
+    def synthesize(self, text: str, lang: str) -> bytes:
+        xml_lang, voice = _TTS_VOICES.get(lang, _TTS_VOICES["en"])
+        ssml = (
+            f"<speak version='1.0' xml:lang='{xml_lang}'>"
+            f"<voice xml:lang='{xml_lang}' name='{voice}'>"
+            f"{_sax.escape(text)}"
+            f"</voice></speak>"
+        )
+        url = f"https://{self.region}.tts.speech.microsoft.com/cognitiveservices/v1"
+        resp = requests.post(
+            url,
+            headers={
+                "Ocp-Apim-Subscription-Key": self.key,
+                "Content-Type": "application/ssml+xml",
+                "X-Microsoft-OutputFormat": _TTS_OUTPUT_FORMAT,
+                "User-Agent": "nanohab-connect",
+            },
+            data=ssml.encode("utf-8"),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.content
+
+
+class FakeSynthesizer:
+    name = "fake_tts_v0"
+
+    def synthesize(self, text: str, lang: str) -> bytes:
+        # No audio pre-key; signal clearly so the app can show a friendly message.
+        raise HTTPException(
+            status_code=503,
+            detail="Text-to-speech is not configured (AZURE_SPEECH_KEY missing).",
+        )
+
+
+def get_synthesizer():
+    if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        return SpeechSynthesizer(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+    return FakeSynthesizer()
+
+
+@app.post("/thread/message/{message_id}/speak")
+def thread_message_speak(
+    message_id: str, lang: str = "", authorization: str = Header(default="")
+):
+    """Synthesize a message as speech in `lang` (default: requester's language,
+    else English). If a cached translation exists for that language, speak the
+    translation; otherwise speak the original body. Returns MP3 audio bytes."""
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    rows = (client.table("messages")
+            .select("id, room_id, body")
+            .eq("id", message_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Message not found")
+    msg = rows[0]
+
+    if not (client.table("room_members").select("member_id")
+            .eq("room_id", msg["room_id"]).eq("member_id", member_id)
+            .limit(1).execute().data or []):
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    tgt = (lang or "").strip() or _member_default_lang(client, member_id)
+
+    # Prefer a cached translation in the target language; else the original.
+    text = (msg.get("body") or "").strip()
+    if tgt:
+        cached = (client.table("message_translations")
+                  .select("translation")
+                  .eq("message_id", message_id).eq("target_language", tgt)
+                  .limit(1).execute().data) or []
+        if cached and (cached[0].get("translation") or "").strip():
+            text = cached[0]["translation"].strip()
+
+    if not text:
+        raise HTTPException(status_code=409, detail="This message has nothing to speak")
+
+    synth = get_synthesizer()
+    try:
+        audio = synth.synthesize(text, tgt or "en")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Speech synthesis failed: {e}")
+
+    return Response(content=audio, media_type="audio/mpeg")
 
