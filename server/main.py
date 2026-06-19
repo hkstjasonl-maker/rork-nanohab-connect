@@ -2888,16 +2888,14 @@ def thread_message_speak(
     return Response(content=audio, media_type="audio/mpeg")
 
 
-
 # ============================================================================
 # THEME 2 — Typed clinical note-drafts (migration 036).
-# The typed-note analogue of /structure. The APP creates the ai_artifacts row
-# directly against Supabase (artifact_type='typed_note', client-side/RLS, the
-# same way voice-note rows are made), optionally sets the transcript, then calls
-# this endpoint with the artifact_id to DRAFT it against a chosen template.
-# This endpoint never inserts a row — it only enriches an existing one, so the
-# state-machine trigger is never bypassed.
-# Path: (app creates row) -> set_transcript -> set_ai_draft, exactly like voice.
+# Members cannot INSERT ai_artifacts (RLS blocks it; artifacts are a service-role
+# write, like the svc_* lane). So this endpoint creates the row with the service
+# client and then drives it down the SAME path a voice note travels:
+#   service-role insert (state 'recorded')
+#     -> set_transcript  (recorded -> transcribed)
+#     -> set_ai_draft    (transcribed -> drafted)   [write-once, trigger-enforced]
 # Clinician-gated decision support: drafts for review, never autonomous output.
 # ============================================================================
 
@@ -2931,16 +2929,11 @@ _TYPED_NOTE_ENGINE = "typed_note_v1"  # provenance LABEL, never a model name
 
 
 def _load_document_template(client, template_key: str):
-    """Resolve a template for drafting: system default from document_templates.
-    (Org/member overrides table exists but is seeded empty in v1; the resolution
-    hook lives here for when the editing UI ships.)"""
     rows = (client.table("document_templates")
             .select("template_key, display_name, discipline, risk_tier, "
                     "output_sections, structured_fields, framework, is_active")
             .eq("template_key", template_key).limit(1).execute().data) or []
-    if not rows:
-        return None
-    return rows[0]
+    return rows[0] if rows else None
 
 
 def _typed_note_system_prompt(tmpl: dict, focus: str, language: str) -> str:
@@ -2967,9 +2960,6 @@ def _typed_note_system_prompt(tmpl: dict, focus: str, language: str) -> str:
 
 
 def _typed_note_generate(system_prompt: str, transcript: str) -> str:
-    """Self-contained draft generation via Azure OpenAI chat completions. Falls
-    back to a clearly-labelled stub when Azure env is not configured, so the flow
-    is testable without keys."""
     if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY and AZURE_OPENAI_DEPLOYMENT):
         return ("[draft engine not configured — stub]\n"
                 "Input received:\n" + (transcript or "").strip())
@@ -2987,95 +2977,74 @@ def _typed_note_generate(system_prompt: str, transcript: str) -> str:
                                  "Content-Type": "application/json"},
                    json=body, timeout=120)
     r.raise_for_status()
-    data = r.json()
-    return (data["choices"][0]["message"]["content"] or "").strip()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
 
 
 @app.post("/thread/typed-note")
 def thread_typed_note(
-    artifact_id: str = Body(...),
+    room_id: str = Body(...),
     template_key: str = Body(...),
-    text: str = Body(default=""),
+    text: str = Body(...),
     language: str = Body(default=""),
     focus: str = Body(default=""),
     authorization: str = Header(default=""),
 ):
-    """Draft a typed clinical note from an existing artifact + a template.
-
-    The app creates the ai_artifacts row (artifact_type='typed_note') client-side,
-    the same way voice-note rows are created. This endpoint then, exactly like
-    /structure: verifies membership, ensures the transcript is set (via set_transcript
-    if the row is still 'recorded' and `text` is supplied), drafts against the
-    template, writes via set_ai_draft (transcribed -> drafted), and audits.
-    """
+    """Create a typed clinical note-draft from text + a template. The backend
+    creates the artifact (service-role; members can't), sets the transcript, drafts
+    against the template, and writes the draft via set_ai_draft."""
     m = resolve_member(authorization)
     member_id = m["id"]
     client = get_service_client()
 
-    rows = (client.table("ai_artifacts")
-            .select("room_id, state, transcript, artifact_type, template_key")
-            .eq("id", artifact_id).limit(1).execute().data) or []
-    if not rows:
-        raise HTTPException(status_code=404, detail="No such artifact")
-    art = rows[0]
-
     member_rows = (client.table("room_members").select("id")
-                   .eq("room_id", art["room_id"]).eq("member_id", member_id)
+                   .eq("room_id", room_id).eq("member_id", member_id)
                    .limit(1).execute().data) or []
     if not member_rows:
-        raise HTTPException(status_code=403, detail="Not a member of this artifact's room")
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    if not (text or "").strip():
+        raise HTTPException(status_code=400, detail="Empty input")
 
     tmpl = _load_document_template(client, template_key)
     if not tmpl:
         raise HTTPException(status_code=404, detail="Unknown template")
 
-    # Ensure the row carries the chosen template (idempotent; harmless if app set it).
-    if art.get("template_key") != template_key:
-        client.table("ai_artifacts").update(
-            {"template_key": template_key}).eq("id", artifact_id).execute()
+    # 1) create the artifact with the service client (RLS-exempt). Start at the
+    #    same initial state a voice note uses so the state machine is respected.
+    try:
+        ins = (client.table("ai_artifacts").insert({
+            "room_id": room_id,
+            "created_by": member_id,
+            "artifact_type": "typed_note",
+            "state": "recorded",
+            "template_key": template_key,
+            "target_language": (language.strip() or None),
+        }).execute().data)
+    except Exception as e:  # noqa: BLE001 — surface the exact DB reason (missing col / trigger)
+        raise HTTPException(status_code=500, detail=f"Could not create artifact: {e}")
+    if not ins:
+        raise HTTPException(status_code=500, detail="Could not create artifact (no row)")
+    artifact_id = ins[0]["id"]
 
-    # Ensure transcript is set and the row is at 'transcribed' before drafting.
-    # If the app already set it (row at 'transcribed'), we reuse it. If the row is
-    # still 'recorded' and the caller supplied text, set it via the same RPC the
-    # voice flow uses (recorded -> transcribed). Otherwise it's a state error.
-    state = art.get("state")
-    transcript = (art.get("transcript") or "").strip()
-    if state == "recorded":
-        if not (text or "").strip():
-            raise HTTPException(status_code=400,
-                                detail="Artifact has no transcript and no text was supplied")
-        transcript = text.strip()
-        client.rpc("set_transcript", {"p_artifact_id": artifact_id,
-                                      "p_transcript": transcript,
-                                      "p_engine": "typed"}).execute()
-        state = "transcribed"
-    elif state == "transcribed":
-        if not transcript and (text or "").strip():
-            # row was created at 'transcribed' with an empty transcript — fill it
-            transcript = text.strip()
-            client.rpc("set_transcript", {"p_artifact_id": artifact_id,
-                                          "p_transcript": transcript,
-                                          "p_engine": "typed"}).execute()
-    if state != "transcribed":
-        raise HTTPException(status_code=409,
-                            detail=f"Artifact is not ready to draft (state={state})")
-    if not transcript:
-        raise HTTPException(status_code=400, detail="Empty transcript")
+    # 2) recorded -> transcribed via the same RPC the voice flow uses
+    client.rpc("set_transcript", {"p_artifact_id": artifact_id,
+                                  "p_transcript": text.strip(),
+                                  "p_engine": "typed"}).execute()
 
+    # 3) draft
     system_prompt = _typed_note_system_prompt(tmpl, focus, language)
     try:
-        draft = _typed_note_generate(system_prompt, transcript)
+        draft = _typed_note_generate(system_prompt, text)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Draft generation failed: {e}")
 
-    # Write the draft through the existing transcribed -> drafted RPC (write-once;
-    # the state-machine trigger enforces it). Same call shape as /structure.
+    # 4) transcribed -> drafted (write-once; trigger-enforced)
     client.rpc("set_ai_draft", {"p_artifact_id": artifact_id, "p_draft": draft,
                                 "p_engine_version": _TYPED_NOTE_ENGINE}).execute()
 
-    # Audit (non-PHI metadata only).
+    # 5) audit (non-PHI metadata only)
     _audit(client, actor_member_id=member_id, action="draft",
-           target_type="artifact", target_id=artifact_id, room_id=art["room_id"],
+           target_type="artifact", target_id=artifact_id, room_id=room_id,
            detail={"template_key": template_key,
                    "risk_tier": tmpl.get("risk_tier"),
                    "language": (language.strip() or None)})
