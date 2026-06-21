@@ -10,8 +10,9 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { Plus, X } from "lucide-react-native";
+import { Plus, X, Image as ImageIcon } from "lucide-react-native";
 import { Theme } from "@/constants/colors";
+import * as ImagePicker from "expo-image-picker";
 import { supabase } from "@/lib/supabase";
 import { getCurrentMemberId } from "@/lib/member";
 
@@ -23,6 +24,7 @@ type Profile = {
   status: "pending" | "approved" | "rejected" | "suspended";
   owner_org_id: string | null;
   owner_member_id: string | null;
+  logo_path: string | null;
 };
 
 type Me = { id: string; org_id: string | null; org_role: string | null };
@@ -37,7 +39,7 @@ async function fetchMe(): Promise<Me | null> {
 async function fetchProfiles(): Promise<Profile[]> {
   const { data, error } = await supabase
     .from("practice_profiles")
-    .select("id, display_name, legal_name, branding_tier, status, owner_org_id, owner_member_id")
+    .select("id, display_name, legal_name, branding_tier, status, owner_org_id, owner_member_id, logo_path")
     .order("created_at", { ascending: false });
   if (error) throw error;
   return (data ?? []) as Profile[];
@@ -265,6 +267,8 @@ const styles = StyleSheet.create({
   segText: { fontSize: 14, fontWeight: "600", color: Theme.textMuted },
   segTextActive: { color: "#fff" },
   err: { color: "#B42318", fontSize: 13, marginTop: 4 },
+  logoRow: { flexDirection: "row", alignItems: "center", gap: 7, marginTop: 8, alignSelf: "flex-start" },
+  logoRowText: { color: Theme.primary, fontSize: 14, fontWeight: "600" },
   reviewRow: { flexDirection: "row", gap: 10, marginTop: 6 },
   reviewBtn: { flex: 1, paddingVertical: 11, borderRadius: 10, alignItems: "center" },
   approveBtn: { backgroundColor: Theme.primary },
