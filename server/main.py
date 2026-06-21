@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.28.0")
+app = FastAPI(title="NanoHab Connect API", version="0.29.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3052,3 +3052,134 @@ def thread_typed_note(
     return {"artifact_id": artifact_id, "state": "drafted",
             "template_key": template_key, "draft": draft,
             "engine": _TYPED_NOTE_ENGINE}
+
+
+# ============================================================================
+# Layer 2a/2c — verifiable PDF export of an approved note (with branding tiers).
+# Gate: caller must be a room member AND the note state in (approved, posted).
+# Branding: optional approved practice_profile drives header/watermark; the
+# verify-QR + document-ID integrity layer is ALWAYS drawn (never removable).
+# Delivery: render -> private 'exports' bucket -> short-TTL signed URL + audit.
+# ============================================================================
+import secrets as _secrets
+
+EXPORT_BUCKET = "exports"
+
+def _gen_doc_id() -> str:
+    """Short, human-quotable document id, e.g. NHC-7F3A-22C9."""
+    raw = _secrets.token_hex(4).upper()
+    return f"NHC-{raw[:4]}-{raw[4:]}"
+
+def _load_brand_for_export(client, profile_id, member_id, member_org):
+    """Resolve an APPROVED practice_profile the caller may use. Returns a brand
+    dict for the builder, or None (tier 0 / NanoHab) if no/invalid profile."""
+    if not profile_id:
+        return None
+    rows = (client.table("practice_profiles")
+            .select("id, owner_org_id, owner_member_id, display_name, brand_color, "
+                    "branding_tier, status")
+            .eq("id", profile_id).limit(1).execute().data) or []
+    if not rows:
+        return None
+    p = rows[0]
+    if p.get("status") != "approved":
+        raise HTTPException(status_code=403, detail="Branding profile is not approved")
+    # caller must own it (org or member) OR be linked to it
+    allowed = False
+    if p.get("owner_org_id") and p["owner_org_id"] == member_org:
+        allowed = True
+    elif p.get("owner_member_id") and p["owner_member_id"] == member_id:
+        allowed = True
+    else:
+        link = (client.table("member_practice_profiles")
+                .select("member_id").eq("profile_id", profile_id)
+                .eq("member_id", member_id).limit(1).execute().data) or []
+        allowed = bool(link)
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Not entitled to this branding profile")
+    return {"tier": p.get("branding_tier"), "name": p.get("display_name"),
+            "color": p.get("brand_color")}
+
+@app.post("/note/{artifact_id}/export-pdf")
+def export_note_pdf(
+    artifact_id: str,
+    style: str = Body(default="hk_uk"),
+    size: str = Body(default="standard"),
+    profile_id: str = Body(default=""),
+    authorization: str = Header(default=""),
+):
+    m = resolve_member(authorization)
+    member_id = m["id"]; member_org = m.get("org_id")
+    client = get_service_client()
+
+    # load the artifact (service role; scope enforced below)
+    rows = (client.table("ai_artifacts")
+            .select("id, room_id, state, approved_text, edited_text, ai_draft, "
+                    "approver_snapshot, template_key, target_language, created_at, "
+                    "session_date, session_type, artifact_type")
+            .eq("id", artifact_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Note not found")
+    art = rows[0]
+
+    # membership gate
+    mem = (client.table("room_members").select("id")
+           .eq("room_id", art["room_id"]).eq("member_id", member_id)
+           .limit(1).execute().data) or []
+    if not mem:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # state gate: only signed documents are exportable
+    if art.get("state") not in ("approved", "posted"):
+        raise HTTPException(status_code=409,
+                            detail="Only approved notes can be exported")
+
+    # the document text = the approved/edited text (never the raw draft if approved)
+    note_text = (art.get("approved_text") or art.get("edited_text")
+                 or art.get("ai_draft") or "")
+
+    # template display name (best-effort; non-fatal)
+    template_name = None
+    if art.get("template_key"):
+        try:
+            t = _load_document_template(client, art["template_key"])
+            template_name = (t or {}).get("name")
+        except Exception:
+            template_name = None
+
+    brand = _load_brand_for_export(client, profile_id or None, member_id, member_org)
+
+    doc_id = _gen_doc_id()
+    verify_url = f"verify.nanohab.com/d/{doc_id}"
+
+    # build the PDF
+    try:
+        from pdfbuilder import build_pdf
+        pdf_bytes = build_pdf(
+            note_text=note_text, snapshot=art.get("approver_snapshot") or {},
+            style=style, size=size, created_at=art.get("created_at"),
+            session_date=art.get("session_date"), session_type=art.get("session_type"),
+            template_name=template_name, doc_id=doc_id, verify_url=verify_url, brand=brand)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"PDF render failed: {e}")
+
+    # store in the private exports bucket
+    path = f"{art['room_id']}/{artifact_id}/{doc_id}.pdf"
+    try:
+        client.storage.from_(EXPORT_BUCKET).upload(
+            path, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Could not store export: {e}")
+
+    # audit (non-PHI metadata only)
+    _audit(client, actor_member_id=member_id, action="export",
+           target_type="artifact", target_id=artifact_id, room_id=art["room_id"],
+           mime_type="application/pdf",
+           detail={"doc_id": doc_id, "style": style, "size": size,
+                   "branding_tier": (brand or {}).get("tier"),
+                   "profile_id": profile_id or None})
+
+    url = _attachment_signed_url(client, EXPORT_BUCKET, path, 300)
+    return {"doc_id": doc_id, "url": url, "expires_in": 300,
+            "branding_tier": (brand or {}).get("tier")}
+

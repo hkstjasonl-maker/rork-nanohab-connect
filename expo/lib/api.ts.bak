@@ -1,0 +1,181 @@
+import { supabase } from "@/lib/supabase";
+
+// Base URL of the Cloud Run backend (already in expo/.env).
+const BASE = (process.env.EXPO_PUBLIC_BACKEND_URL ?? "").replace(/\/+$/, "");
+
+async function authHeader(): Promise<Record<string, string>> {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) {
+    throw new Error("Not signed in");
+  }
+  return { Authorization: `Bearer ${token}` };
+}
+
+async function safeText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+export type RNFile = { uri: string; name: string; type: string };
+
+export type UploadResult = {
+  id: string;
+  scan_status: string;
+  mime_type: string;
+  size_bytes: number;
+  exif_stripped: boolean;
+};
+
+// Multipart upload to POST /thread/attach. The backend validates by magic bytes,
+// strips EXIF on images, stores privately, and records the row (scan -> clean).
+export async function uploadAttachment(
+  roomId: string,
+  messageId: string,
+  file: RNFile,
+): Promise<UploadResult> {
+  if (!BASE) {
+    throw new Error("EXPO_PUBLIC_BACKEND_URL is not set");
+  }
+  const headers = await authHeader();
+  const form = new FormData();
+  form.append("room_id", roomId);
+  form.append("message_id", messageId);
+  form.append("is_clinical", "true");
+  // React Native multipart file part (uri/name/type). Do NOT set Content-Type;
+  // RN fills in the multipart boundary automatically.
+  form.append("file", { uri: file.uri, name: file.name, type: file.type } as unknown as Blob);
+  const res = await fetch(`${BASE}/thread/attach`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  if (!res.ok) {
+    throw new Error(`Upload failed (${res.status}): ${await safeText(res)}`);
+  }
+  return (await res.json()) as UploadResult;
+}
+
+export type SignedUrl = { url: string; expires_in: number; mime_type: string };
+
+// GET /thread/attachment/{id} -> short-TTL signed URL (gated on membership + clean).
+export async function getAttachmentUrl(attachmentId: string): Promise<SignedUrl> {
+  const headers = await authHeader();
+  const res = await fetch(`${BASE}/thread/attachment/${attachmentId}`, { headers });
+  if (!res.ok) {
+    throw new Error(`Could not load attachment (${res.status})`);
+  }
+  return (await res.json()) as SignedUrl;
+}
+
+// Member-lane RPC (RLS), same shape as create_voice_artifact. Returns the
+// transcript artifact id; the transcript itself is produced async by /drain.
+export async function transcribeAttachment(attachmentId: string): Promise<string> {
+  const { data, error } = await supabase.rpc("create_attachment_transcript", {
+    p_attachment_id: attachmentId,
+  });
+  if (error) {
+    throw error;
+  }
+  return data as string;
+}
+
+export type TranslateResult = {
+  translation_artifact_id: string;
+  source_artifact_id: string;
+  target_language: string;
+  detected_source: string | null;
+  engine: string;
+  state: string;
+  original: string;
+  translation: string;
+  disclaimer: string;
+};
+
+// POST /thread/transcript/{id}/translate (synchronous). Target optional; the
+// backend seeds it from the member's stored language, else English.
+export async function translateTranscript(
+  sourceArtifactId: string,
+  target?: string,
+): Promise<TranslateResult> {
+  const headers = await authHeader();
+  const q = target ? `?target=${encodeURIComponent(target)}` : "";
+  const res = await fetch(
+    `${BASE}/thread/transcript/${sourceArtifactId}/translate${q}`,
+    { method: "POST", headers },
+  );
+  if (!res.ok) {
+    throw new Error(`Translation failed (${res.status})`);
+  }
+  return (await res.json()) as TranslateResult;
+}
+
+
+export type MessageTranslation = {
+  message_id: string;
+  target_language: string;
+  detected_source: string | null;
+  engine: string;
+  original: string;
+  translation: string;
+  disclaimer: string;
+};
+
+// Translate a single text message. target: "en" | "zh-Hant" | "zh-Hans" | "".
+export async function translateMessage(
+  messageId: string,
+  target?: string,
+): Promise<MessageTranslation> {
+  const headers = await authHeader();
+  const q = target ? `?target=${encodeURIComponent(target)}` : "";
+  const res = await fetch(
+    `${BASE}/thread/message/${messageId}/translate${q}`,
+    { method: "POST", headers },
+  );
+  if (!res.ok) {
+    throw new Error(`Translation failed (${res.status})`);
+  }
+  return (await res.json()) as MessageTranslation;
+}
+
+
+// Read-aloud: fetch synthesized speech for a message and return a playable
+// data: URI (base64 MP3). expo-av's Audio.Sound can load a data URI directly.
+export async function speakMessage(
+  messageId: string,
+  lang?: string,
+): Promise<string> {
+  const headers = await authHeader();
+  const q = lang ? `?lang=${encodeURIComponent(lang)}` : "";
+  const res = await fetch(`${BASE}/thread/message/${messageId}/speak${q}`, {
+    method: "POST",
+    headers,
+  });
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const j = await res.json();
+      detail = j?.detail ?? detail;
+    } catch {
+      // body wasn't JSON
+    }
+    throw new Error(`Speak failed: ${detail}`);
+  }
+  // Bytes -> base64 -> data URI (no filesystem needed).
+  const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + chunk)),
+    );
+  }
+  const b64 = globalThis.btoa(binary);
+  return `data:audio/mpeg;base64,${b64}`;
+}
+

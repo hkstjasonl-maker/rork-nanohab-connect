@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import { ChevronDown, ChevronUp } from "lucide-react-native";
+import { ChevronDown, ChevronUp, Inbox, Check } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -17,6 +17,10 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Theme } from "@/constants/colors";
 import { supabase } from "@/lib/supabase";
+import SignatureBlock, { type ApproverSnapshot } from "@/components/SignatureBlock";
+import ApprovalGate from "@/components/ApprovalGate";
+import { fetchRoomReviewRequests, markReviewDone, type ReviewRequest } from "@/lib/reviews";
+import { getCurrentMemberId } from "@/lib/member";
 
 type ArtifactRow = {
   id: string;
@@ -26,6 +30,8 @@ type ArtifactRow = {
   ai_draft: string | null;
   edited_text: string | null;
   approved_text: string | null;
+  approver_snapshot: ApproverSnapshot | null;
+  resolved_at: string | null;
 };
 
 const POLLING_STATES = new Set(["recorded"]);
@@ -34,7 +40,7 @@ async function fetchArtifact(artifactId: string): Promise<ArtifactRow> {
   const { data, error } = await supabase
     .from("ai_artifacts")
     .select(
-      "id, room_id, state, transcript, ai_draft, edited_text, approved_text",
+      "id, room_id, state, transcript, ai_draft, edited_text, approved_text, approver_snapshot, resolved_at",
     )
     .eq("id", artifactId)
     .single();
@@ -49,6 +55,9 @@ export default function NoteReviewScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
+  const myIdQuery = useQuery({ queryKey: ["my-member-id"], queryFn: getCurrentMemberId });
+  const myMemberId = myIdQuery.data ?? null;
+  const [bannerCollapsed, setBannerCollapsed] = useState(false);
 
   const [editedText, setEditedText] = useState<string>("");
   const [didInitDraft, setDidInitDraft] = useState<boolean>(false);
@@ -62,6 +71,24 @@ export default function NoteReviewScreen() {
   });
 
   const artifact = artifactQuery.data;
+  const reviewReqQuery = useQuery({
+    queryKey: ["artifact-review", artifactId, myMemberId],
+    enabled: !!artifactId && !!myMemberId && !!artifact?.room_id,
+    queryFn: async () => {
+      const all = await fetchRoomReviewRequests(artifact?.room_id ?? "");
+      return all.find((x: ReviewRequest) => x.artifact_id === artifactId && x.requested_for === myMemberId) ?? null;
+    },
+  });
+  const myReviewReq = reviewReqQuery.data ?? null;
+  const markRead = useMutation({
+    mutationFn: () => markReviewDone(artifactId),
+    onSuccess: async () => {
+      setBannerCollapsed(true);
+      await queryClient.invalidateQueries({ queryKey: ["artifact-review", artifactId, myMemberId] });
+      await queryClient.invalidateQueries({ queryKey: ["review-requests", artifact?.room_id] });
+    },
+  });
+
   const state = artifact?.state;
 
   // Poll while transcribing.
@@ -230,6 +257,23 @@ export default function NoteReviewScreen() {
           ]}
           keyboardShouldPersistTaps="handled"
         >
+          {myReviewReq ? (
+            (myReviewReq.reviewed_at || bannerCollapsed) ? (
+              <Pressable style={styles.reviewChip} onPress={() => setBannerCollapsed((v) => !v)} testID="review-banner">
+                <Check color={Theme.primary} size={14} />
+                <Text style={styles.reviewChipText}>Read</Text>
+              </Pressable>
+            ) : (
+              <View style={styles.reviewBanner} testID="review-banner">
+                <Inbox color={Theme.primary} size={18} />
+                <Text style={styles.reviewBannerText}>A teammate asked you to review this.</Text>
+                <Pressable style={styles.reviewBtn} onPress={() => markRead.mutate()} disabled={markRead.isPending} testID="mark-read">
+                  {markRead.isPending ? <ActivityIndicator color="#FFFFFF" size="small" /> : <Text style={styles.reviewBtnText}>Mark as read</Text>}
+                </Pressable>
+              </View>
+            )
+          ) : null}
+
           {/* recorded → transcribing */}
           {state === "recorded" ? (
             <View style={styles.centered}>
@@ -304,21 +348,8 @@ export default function NoteReviewScreen() {
                 </View>
               ) : null}
 
-              <Pressable
-                style={({ pressed }) => [
-                  styles.primaryBtn,
-                  (isBusy || pressed) && styles.btnPressed,
-                ]}
-                onPress={() => saveAsNote.mutate()}
-                disabled={isBusy}
-                testID="save-note-button"
-              >
-                {saveAsNote.isPending ? (
-                  <ActivityIndicator color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.primaryBtnText}>Save as note</Text>
-                )}
-              </Pressable>
+              <ApprovalGate onApprove={() => saveAsNote.mutate()} busy={isBusy} />
+
 
               <Pressable
                 style={({ pressed }) => [
@@ -354,7 +385,7 @@ export default function NoteReviewScreen() {
               <View style={styles.readBlock}>
                 <Text style={styles.readText}>{finalText}</Text>
               </View>
-              <Text style={styles.caption}>This note is final.</Text>
+              <SignatureBlock snapshot={artifact.approver_snapshot} />
             </View>
           ) : null}
 
@@ -373,6 +404,12 @@ export default function NoteReviewScreen() {
 }
 
 const styles = StyleSheet.create({
+  reviewBanner: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: Theme.surface, borderWidth: 1, borderColor: Theme.primary, borderRadius: 12, padding: 12, marginBottom: 4 },
+  reviewBannerText: { flex: 1, fontSize: 14, color: Theme.text, fontWeight: "500" },
+  reviewBtn: { backgroundColor: Theme.primary, borderRadius: 999, paddingHorizontal: 14, paddingVertical: 7 },
+  reviewBtnText: { color: "#FFFFFF", fontWeight: "700", fontSize: 13 },
+  reviewChip: { alignSelf: "flex-start", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: Theme.surface, borderWidth: 1, borderColor: Theme.border, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, marginBottom: 4 },
+  reviewChipText: { color: Theme.primary, fontWeight: "700", fontSize: 12 },
   container: { flex: 1, backgroundColor: Theme.background },
   loader: { marginTop: 60 },
   content: { padding: 20, gap: 16 },

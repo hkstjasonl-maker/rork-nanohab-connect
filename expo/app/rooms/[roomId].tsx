@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenCapture from "expo-screen-capture";
-import { FileText, Headphones, Mic, Send, UserPlus, X } from "lucide-react-native";
+import { FilePlus, FileText, Headphones, Mic, NotebookPen, ScrollText, Send, UserPlus, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Animated,
   ActivityIndicator,
   FlatList,
   KeyboardAvoidingView,
@@ -19,7 +20,17 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Theme } from "@/constants/colors";
 import { getCurrentMemberId } from "@/lib/member";
+import { AttachComposer } from "@/components/AttachComposer";
+import { MessageAttachments } from "@/components/MessageAttachments";
+import { MessageBody } from "@/components/MessageBody";
+import { DisplayLanguageButton } from "@/components/DisplayLanguageButton";
+import { UnreadBanner } from "@/components/UnreadBanner";
+import TypePicker from "@/components/TypePicker";
+import TypedNoteReview from "@/components/TypedNoteReview";
+import { createTypedNote, type DocumentTemplate } from "@/lib/typedNotes";
 import { supabase } from "@/lib/supabase";
+
+const AnimatedTextInput = Animated.createAnimatedComponent(TextInput);
 
 type MessageRow = {
   id: string;
@@ -178,6 +189,46 @@ export default function RoomThreadScreen() {
 
   const caseId = roomQuery.data?.case_id;
 
+  const displayLangQuery = useQuery({
+    queryKey: ["my-display-language"],
+    queryFn: async (): Promise<{ lang: string | null; auto: boolean }> => {
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) {
+        return { lang: null, auto: false };
+      }
+      const { data } = await supabase
+        .from("members")
+        .select("display_language, auto_translate")
+        .eq("auth_user_id", u.user.id)
+        .maybeSingle();
+      return { lang: (data?.display_language ?? null) as string | null, auto: !!data?.auto_translate };
+    },
+  });
+  const displayLanguage = displayLangQuery.data?.lang ?? null;
+  const autoTranslate = displayLangQuery.data?.auto ?? false;
+  const myMemberQuery = useQuery({
+    queryKey: ["my-member-id"],
+    queryFn: () => getCurrentMemberId(),
+  });
+  const myMemberId = myMemberQuery.data ?? null;
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [drafting, setDrafting] = useState(false);
+  const [review, setReview] = useState<{ draft: string; tmpl: DocumentTemplate } | null>(null);
+  const startTypedNote = async (templateKey: string, tmpl: DocumentTemplate) => {
+    const text = body.trim();
+    if (!text) { return; }
+    try {
+      setDrafting(true);
+      const res = await createTypedNote({ roomId, templateKey, text, language: displayLanguage ?? "" });
+      router.push(`/note/${res.artifact_id}`);
+      setBody("");
+    } catch (e) {
+      console.error("typed-note failed", e);
+    } finally {
+      setDrafting(false);
+    }
+  };
+
   const recordingsQuery = useQuery({
     queryKey: ["recordings", roomId],
     queryFn: () => fetchRecordings(roomId),
@@ -237,6 +288,16 @@ export default function RoomThreadScreen() {
 
   const messages = useMemo(() => messagesQuery.data ?? [], [messagesQuery.data]);
 
+  // Scroll to newest only when the message COUNT grows (a real new message) or
+  // on first load — never on in-place height changes (e.g. showing a translation).
+  const prevCountRef = useRef<number>(0);
+  useEffect(() => {
+    if (messages.length > prevCountRef.current) {
+      requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: false }));
+    }
+    prevCountRef.current = messages.length;
+  }, [messages.length]);
+
   const onSend = useCallback(() => {
     const trimmed = body.trim();
     if (trimmed.length === 0 || sendMessage.isPending) {
@@ -245,6 +306,27 @@ export default function RoomThreadScreen() {
     sendMessage.mutate(trimmed);
   }, [body, sendMessage]);
 
+  const composerGlow = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(composerGlow, {
+      toValue: body.trim().length > 0 ? 1 : 0,
+      duration: 200,
+      useNativeDriver: false,
+    }).start();
+  }, [body, composerGlow]);
+  const glowBorder = composerGlow.interpolate({
+    inputRange: [0, 1],
+    outputRange: [Theme.border, Theme.primary],
+  });
+  const glowShadow = composerGlow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.28] });
+  const pillShift = composerGlow.interpolate({ inputRange: [0, 1], outputRange: [6, 0] });
+  const composerGlowStyle = {
+    borderColor: glowBorder,
+    shadowColor: Theme.primary,
+    shadowOpacity: glowShadow,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 0 },
+  };
   const headerTitle =
     roomQuery.data?.title && roomQuery.data.title.length > 0
       ? roomQuery.data.title
@@ -264,6 +346,8 @@ export default function RoomThreadScreen() {
           headerBackTitle: "Case",
           headerRight: () => (
             <View style={styles.headerActions}>
+              
+              <DisplayLanguageButton current={displayLanguage} autoTranslate={autoTranslate} />
               <Pressable
                 onPress={() => router.push(`/live/${roomId}`)}
                 hitSlop={12}
@@ -276,14 +360,14 @@ export default function RoomThreadScreen() {
                 hitSlop={12}
                 testID="voice-notes-button"
               >
-                <Mic color={Theme.primary} size={22} />
+                <NotebookPen color={Theme.primary} size={22} />
               </Pressable>
               <Pressable
                 onPress={() => setIsRecordingsOpen(true)}
                 hitSlop={12}
                 testID="recordings-button"
               >
-                <FileText color={Theme.primary} size={22} />
+                <ScrollText color={Theme.primary} size={22} />
               </Pressable>
               <Pressable
                 onPress={() => setIsAddOpen(true)}
@@ -297,6 +381,13 @@ export default function RoomThreadScreen() {
         }}
       />
 
+      <UnreadBanner roomId={roomId} messages={messages} myMemberId={myMemberId} displayLanguage={displayLanguage} />
+      <TypePicker visible={pickerOpen} onClose={() => setPickerOpen(false)} suggestText={body} onPick={startTypedNote} />
+      <Modal visible={!!review} animationType="slide" onRequestClose={() => setReview(null)}>
+        {review ? (
+          <TypedNoteReview draft={review.draft} templateName={review.tmpl.display_name} riskTier={review.tmpl.risk_tier} onClose={() => setReview(null)} onApprove={async () => { setReview(null); }} onSaveEdit={async () => { setReview(null); }} />
+        ) : null}
+      </Modal>
       {messagesQuery.isLoading ? (
         <ActivityIndicator color={Theme.primary} style={styles.loader} />
       ) : (
@@ -305,9 +396,6 @@ export default function RoomThreadScreen() {
           data={messages}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.listContent}
-          onContentSizeChange={() =>
-            listRef.current?.scrollToEnd({ animated: false })
-          }
           renderItem={({ item }) => (
             <View style={styles.message}>
               <View style={styles.messageHead}>
@@ -316,7 +404,8 @@ export default function RoomThreadScreen() {
                 </Text>
                 <Text style={styles.time}>{formatTime(item.created_at)}</Text>
               </View>
-              <Text style={styles.body}>{item.body}</Text>
+              <MessageBody item={item} displayLanguage={displayLanguage} autoTranslate={autoTranslate} />
+              <MessageAttachments roomId={roomId} messageId={item.id} />
             </View>
           )}
           ListEmptyComponent={
@@ -327,9 +416,23 @@ export default function RoomThreadScreen() {
         />
       )}
 
+      {body.trim().length > 0 ? (
+        <Animated.View
+          style={[styles.makeNoteBar, { opacity: composerGlow, transform: [{ translateY: pillShift }] }]}
+        >
+          <Pressable
+            style={styles.makeNotePill}
+            onPress={() => setPickerOpen(true)}
+            testID="make-note-pill"
+          >
+            <FilePlus color={Theme.primary} size={16} />
+            <Text style={styles.makeNotePillText}>Make note</Text>
+          </Pressable>
+        </Animated.View>
+      ) : null}
       <View style={[styles.composer, { paddingBottom: insets.bottom + 10 }]}>
-        <TextInput
-          style={styles.composerInput}
+        <AnimatedTextInput
+          style={[styles.composerInput, composerGlowStyle]}
           value={body}
           onChangeText={setBody}
           placeholder="Write a message"
@@ -337,6 +440,7 @@ export default function RoomThreadScreen() {
           multiline
           testID="message-input"
         />
+        <AttachComposer roomId={roomId} caption={body} onSent={() => setBody("")} />
         <Pressable
           style={({ pressed }) => [
             styles.send,
@@ -364,7 +468,7 @@ export default function RoomThreadScreen() {
       >
         <View style={styles.sheet}>
           <View style={styles.sheetHeader}>
-            <Text style={styles.sheetTitle}>Recent recordings</Text>
+            <Text style={styles.sheetTitle}>Meeting minutes</Text>
             <Pressable onPress={() => setIsRecordingsOpen(false)} hitSlop={12}>
               <X color={Theme.textMuted} size={24} />
             </Pressable>
@@ -374,7 +478,7 @@ export default function RoomThreadScreen() {
             <ActivityIndicator color={Theme.primary} style={styles.loader} />
           ) : (recordingsQuery.data ?? []).length === 0 ? (
             <Text style={styles.emptyText}>
-              No recordings yet for this room.
+              No meeting minutes yet for this room.
             </Text>
           ) : (
             <FlatList
@@ -397,7 +501,7 @@ export default function RoomThreadScreen() {
                 >
                   <View style={styles.addRowText}>
                     <Text style={styles.memberName}>
-                      {formatTime(item.created_at)} ·{" "}
+                      {formatTime(item.created_at)} 繚{" "}
                       {new Date(item.created_at).toLocaleDateString()}
                     </Text>
                     <Text style={styles.memberRole}>
@@ -526,6 +630,19 @@ const styles = StyleSheet.create({
   },
   sendPressed: { backgroundColor: Theme.primaryPressed },
   sendDisabled: { opacity: 0.4 },
+  makeNoteBar: { paddingHorizontal: 16, paddingBottom: 8, alignItems: "flex-start" },
+  makeNotePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: Theme.primary,
+    backgroundColor: Theme.surface,
+  },
+  makeNotePillText: { color: Theme.primary, fontWeight: "700", fontSize: 13 },
   sheet: { flex: 1, backgroundColor: Theme.background, padding: 24 },
   sheetHeader: {
     flexDirection: "row",
