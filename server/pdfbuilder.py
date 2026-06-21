@@ -137,8 +137,26 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
     except Exception:
         bcolor = TEAL
 
+    # optional clinic logo (drawn at the top-left; name sits beside/below it)
+    logo_bytes = (brand or {}).get("logo_bytes")
+    logo_h = 0
+    if logo_bytes and tier in ("cobrand", "whitelabel"):
+        try:
+            from reportlab.lib.utils import ImageReader
+            import io as _io
+            ir = ImageReader(_io.BytesIO(logo_bytes))
+            iw, ih = ir.getSize()
+            target_h = 30  # pt
+            target_w = target_h * (iw / ih) if ih else target_h
+            target_w = min(target_w, 150)  # cap width
+            c.drawImage(ir, M, H - M - target_h + 4, width=target_w, height=target_h,
+                        preserveAspectRatio=True, mask="auto")
+            logo_h = target_h + 6
+        except Exception:
+            logo_h = 0
+
     # header
-    y = H - M
+    y = H - M - logo_h
     if tier in ("cobrand", "whitelabel") and bname:
         # clinic identity primary
         c.setFillColor(bcolor); c.setFont("Helvetica-Bold", S["title"])

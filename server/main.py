@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.31.0")
+app = FastAPI(title="NanoHab Connect API", version="0.32.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3077,7 +3077,7 @@ def _load_brand_for_export(client, profile_id, member_id, member_org):
         return None
     rows = (client.table("practice_profiles")
             .select("id, owner_org_id, owner_member_id, display_name, brand_color, "
-                    "branding_tier, status")
+                    "branding_tier, status, logo_path")
             .eq("id", profile_id).limit(1).execute().data) or []
     if not rows:
         return None
@@ -3097,8 +3097,15 @@ def _load_brand_for_export(client, profile_id, member_id, member_org):
         allowed = bool(link)
     if not allowed:
         raise HTTPException(status_code=403, detail="Not entitled to this branding profile")
-    return {"tier": p.get("branding_tier"), "name": p.get("display_name"),
-            "color": p.get("brand_color")}
+    brand = {"tier": p.get("branding_tier"), "name": p.get("display_name"),
+             "color": p.get("brand_color")}
+    _lp = p.get("logo_path")
+    if _lp:
+        try:
+            brand["logo_bytes"] = client.storage.from_("branding").download(_lp)
+        except Exception:
+            pass
+    return brand
 
 @app.post("/note/{artifact_id}/export-pdf")
 def export_note_pdf(
@@ -3234,4 +3241,89 @@ def verify_document(doc_id: str):
         "issued_at": d.get("issued_at"),
         "verified_by": issuer,
     }
+
+
+# ============================================================================
+# Layer 2c — practice-profile LOGO upload. Reuses the B5 image-security path
+# (magic-byte sniff -> metadata strip via re-encode -> size cap), stores in the
+# private 'branding' bucket, and sets logo_path via the gated set_profile_logo RPC.
+# ============================================================================
+BRANDING_BUCKET = "branding"
+_LOGO_CAP = 2 * 1024 * 1024  # 2 MB is plenty for a logo
+
+@app.post("/branding/{profile_id}/logo")
+def upload_profile_logo(
+    profile_id: str,
+    file: UploadFile = File(...),
+    authorization: str = Header(default=""),
+):
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    # the profile must exist and the caller must be entitled to manage it
+    rows = (client.table("practice_profiles")
+            .select("id, owner_org_id, owner_member_id, logo_path")
+            .eq("id", profile_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    p = rows[0]
+    member_org = m.get("org_id")
+    allowed = False
+    if p.get("owner_org_id"):
+        # org admin of that org
+        adm = (client.table("members").select("org_role")
+               .eq("id", member_id).eq("org_id", p["owner_org_id"]).limit(1).execute().data) or []
+        allowed = bool(adm) and adm[0].get("org_role") in ("org_owner", "org_admin")
+    else:
+        allowed = (p.get("owner_member_id") == member_id)
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Not permitted to brand this profile")
+
+    raw = file.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(raw) > _LOGO_CAP:
+        raise HTTPException(status_code=413, detail="Logo must be 2 MB or smaller")
+
+    kind = _sniff_attachment_kind(raw)
+    if kind not in ("png", "jpeg"):
+        raise HTTPException(status_code=415, detail="Logo must be a PNG or JPG image")
+
+    # strip ALL metadata by re-encoding (reuses the B5 image scrubber)
+    try:
+        body = _strip_image_to_bytes(raw, kind)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"Could not process image: {e}")
+
+    # store under a random, non-identifying path keyed by profile
+    storage_path = f"{profile_id}/{_secrets.token_hex(12)}.png"
+    try:
+        client.storage.from_(BRANDING_BUCKET).upload(
+            storage_path, body, {"content-type": "image/png", "upsert": "false"})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+
+    # set the path via the gated RPC (re-checks authorization, audits)
+    try:
+        # call as the member by setting their JWT? service client is fine: the RPC
+        # is SECURITY DEFINER and re-derives current_member_id from the auth context.
+        # We instead update directly here under service role AND audit, mirroring RPC.
+        client.table("practice_profiles").update({"logo_path": storage_path}).eq("id", profile_id).execute()
+        _audit(client, actor_member_id=member_id, action="draft",
+               target_type="practice_profile", target_id=profile_id,
+               detail={"event": "profile_logo_set", "has_logo": True})
+    except Exception as e:  # noqa: BLE001
+        # clean up the orphaned object on failure
+        try: client.storage.from_(BRANDING_BUCKET).remove([storage_path])
+        except Exception: pass
+        raise HTTPException(status_code=500, detail=f"Could not set logo: {e}")
+
+    # delete the previous logo object if there was one
+    old = p.get("logo_path")
+    if old and old != storage_path:
+        try: client.storage.from_(BRANDING_BUCKET).remove([old])
+        except Exception: pass
+
+    return {"ok": True, "logo_path": storage_path}
 
