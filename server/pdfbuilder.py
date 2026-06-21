@@ -151,7 +151,7 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
             target_w = min(target_w, 150)  # cap width
             c.drawImage(ir, M, H - M - target_h + 4, width=target_w, height=target_h,
                         preserveAspectRatio=True, mask="auto")
-            logo_h = target_h + 6
+            logo_h = target_h + 16
         except Exception:
             logo_h = 0
 
