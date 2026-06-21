@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.32.0")
+app = FastAPI(title="NanoHab Connect API", version="0.33.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3326,4 +3326,31 @@ def upload_profile_logo(
         except Exception: pass
 
     return {"ok": True, "logo_path": storage_path}
+
+
+# ============================================================================
+# Layer 2c — OPERATOR tier-setting (paid upgrade path). White-label is a paid
+# entitlement, so granting it requires NanoHab operator authority (a different
+# credential than any clinician holds). Operator may set ANY tier; audited.
+# ============================================================================
+@app.post("/ops/profile/{profile_id}/tier")
+def ops_set_profile_tier(
+    profile_id: str,
+    tier: str = Body(..., embed=True),
+    x_operator_key: str = Header(default=""),
+):
+    require_operator(x_operator_key)
+    if tier not in ("cobrand", "whitelabel"):
+        raise HTTPException(status_code=400, detail="tier must be cobrand or whitelabel")
+    client = get_service_client()
+    rows = (client.table("practice_profiles")
+            .select("id, branding_tier").eq("id", profile_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    old = rows[0].get("branding_tier")
+    client.table("practice_profiles").update({"branding_tier": tier}).eq("id", profile_id).execute()
+    _audit(client, actor_member_id=None, action="draft",
+           target_type="practice_profile", target_id=profile_id,
+           detail={"event": "profile_tier_set", "from": old, "to": tier, "by": "operator"})
+    return {"ok": True, "profile_id": profile_id, "branding_tier": tier}
 
