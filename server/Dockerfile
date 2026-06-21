@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY main.py .
+COPY pdfbuilder.py .
+COPY fonts/ ./fonts/
 
 # Cloud Run sends traffic to $PORT (defaults to 8080). Listen on it.
 ENV PORT=8080
