@@ -13,6 +13,7 @@ import {
 import { Plus, X } from "lucide-react-native";
 import { Theme } from "@/constants/colors";
 import { supabase } from "@/lib/supabase";
+import { getCurrentMemberId } from "@/lib/member";
 
 type Profile = {
   id: string;
@@ -24,6 +25,15 @@ type Profile = {
   owner_member_id: string | null;
 };
 
+type Me = { id: string; org_id: string | null; org_role: string | null };
+async function fetchMe(): Promise<Me | null> {
+  const id = await getCurrentMemberId();
+  if (!id) return null;
+  const { data, error } = await supabase
+    .from("members").select("id, org_id, org_role").eq("id", id).maybeSingle();
+  if (error || !data) return null;
+  return data as Me;
+}
 async function fetchProfiles(): Promise<Profile[]> {
   const { data, error } = await supabase
     .from("practice_profiles")
@@ -43,6 +53,7 @@ const STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = 
 export default function BrandingScreen() {
   const qc = useQueryClient();
   const { data, isLoading, isError } = useQuery({ queryKey: ["practice-profiles"], queryFn: fetchProfiles });
+  const { data: me } = useQuery({ queryKey: ["me-role"], queryFn: fetchMe });
   const [formOpen, setFormOpen] = useState(false);
 
   return (
@@ -59,7 +70,7 @@ export default function BrandingScreen() {
       ) : isError ? (
         <Text style={styles.muted}>Could not load your profiles.</Text>
       ) : (data && data.length > 0) ? (
-        data.map((p) => <ProfileCard key={p.id} p={p} />)
+        data.map((p) => <ProfileCard key={p.id} p={p} me={me ?? null} onChange={() => qc.invalidateQueries({ queryKey: ["practice-profiles"] })} />)
       ) : (
         <View style={styles.empty}>
           <Text style={styles.emptyText}>No practice profiles yet.</Text>
@@ -80,10 +91,36 @@ export default function BrandingScreen() {
   );
 }
 
-function ProfileCard({ p }: { p: Profile }) {
+function ProfileCard({ p, me, onChange }: { p: Profile; me: Me | null; onChange: () => void }) {
   const s = STATUS_STYLE[p.status] ?? STATUS_STYLE.pending;
   const tier = p.branding_tier === "whitelabel" ? "White-label" : "Co-brand";
   const scope = p.owner_org_id ? "Organisation" : "Personal";
+  const [busy, setBusy] = useState<null | "approved" | "rejected">(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Org-owner of THIS profile's org can approve/reject a pending ORG profile.
+  const canReview =
+    p.status === "pending" &&
+    !!p.owner_org_id &&
+    !!me &&
+    me.org_role === "org_owner" &&
+    me.org_id === p.owner_org_id;
+
+  const review = async (decision: "approved" | "rejected") => {
+    setBusy(decision); setErr(null);
+    try {
+      const { error } = await supabase.rpc("review_practice_profile", {
+        p_profile_id: p.id, p_decision: decision, p_note: null,
+      });
+      if (error) throw error;
+      onChange();
+    } catch (e: any) {
+      setErr(e?.message ?? "Could not update. Please try again.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <View style={styles.card}>
       <View style={styles.cardTop}>
@@ -91,6 +128,17 @@ function ProfileCard({ p }: { p: Profile }) {
         <View style={[styles.pill, { backgroundColor: s.bg }]}><Text style={[styles.pillText, { color: s.fg }]}>{s.label}</Text></View>
       </View>
       <Text style={styles.cardMeta}>{scope}  {"\u00b7"}  {tier}{p.legal_name ? `  ${"\u00b7"}  ${p.legal_name}` : ""}</Text>
+      {canReview ? (
+        <View style={styles.reviewRow}>
+          <Pressable style={[styles.reviewBtn, styles.approveBtn]} onPress={() => review("approved")} disabled={busy !== null}>
+            {busy === "approved" ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.approveText}>Approve</Text>}
+          </Pressable>
+          <Pressable style={[styles.reviewBtn, styles.rejectBtn]} onPress={() => review("rejected")} disabled={busy !== null}>
+            {busy === "rejected" ? <ActivityIndicator color={Theme.text} size="small" /> : <Text style={styles.rejectText}>Reject</Text>}
+          </Pressable>
+        </View>
+      ) : null}
+      {err ? <Text style={styles.err}>{err}</Text> : null}
     </View>
   );
 }
@@ -217,6 +265,12 @@ const styles = StyleSheet.create({
   segText: { fontSize: 14, fontWeight: "600", color: Theme.textMuted },
   segTextActive: { color: "#fff" },
   err: { color: "#B42318", fontSize: 13, marginTop: 4 },
+  reviewRow: { flexDirection: "row", gap: 10, marginTop: 6 },
+  reviewBtn: { flex: 1, paddingVertical: 11, borderRadius: 10, alignItems: "center" },
+  approveBtn: { backgroundColor: Theme.primary },
+  approveText: { color: "#fff", fontSize: 14.5, fontWeight: "700" },
+  rejectBtn: { borderWidth: 1, borderColor: Theme.border },
+  rejectText: { color: Theme.text, fontSize: 14.5, fontWeight: "600" },
   submit: { backgroundColor: Theme.primary, borderRadius: 12, paddingVertical: 15, alignItems: "center", marginTop: 12 },
   submitBusy: { opacity: 0.7 },
   submitText: { color: "#fff", fontSize: 16, fontWeight: "700" },
