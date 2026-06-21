@@ -12,6 +12,10 @@ Renders an approved note as a verifiable PDF with:
 CJK via reportlab Adobe CID fonts (no font files shipped).
 """
 import io, datetime
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 from reportlab.lib.pagesizes import A4, LETTER
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -88,15 +92,29 @@ def _security_background(c, W, H, cjk, brand):
     c.drawCentredString(0, 0, wm.upper())
     c.restoreState()
 
-def _qr_placeholder(c, x, y, size, doc_id):
-    """QR placeholder box (Layer 2b will swap in a real qrcode image)."""
+def _qr_placeholder(c, x, y, size, doc_id, verify_url=None):
+    """Render a real QR encoding the verify URL. Falls back to a labelled box if
+    the qrcode lib is unavailable (so export never hard-fails on the QR)."""
+    payload = ("https://" + verify_url) if (verify_url and not str(verify_url).startswith("http")) else (verify_url or "")
+    if qrcode is not None and payload:
+        try:
+            qr = qrcode.QRCode(border=1, box_size=4,
+                               error_correction=qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(payload); qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+            from reportlab.lib.utils import ImageReader
+            c.drawImage(ImageReader(bio), x, y, width=size, height=size,
+                        preserveAspectRatio=True, mask="auto")
+            return
+        except Exception:
+            pass
+    # fallback box
     c.saveState()
     c.setStrokeColor(HAIR); c.setLineWidth(0.8)
     c.rect(x, y, size, size, stroke=1, fill=0)
     c.setFont("Helvetica", 5); c.setFillColor(MUTED)
-    c.drawCentredString(x+size/2, y+size/2+4, "VERIFY")
-    c.drawCentredString(x+size/2, y+size/2-3, "QR")
-    c.drawCentredString(x+size/2, y+size/2-10, "(2b)")
+    c.drawCentredString(x+size/2, y+size/2, "VERIFY")
     c.restoreState()
 
 def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
@@ -199,7 +217,7 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
     c.drawString(M, rule_y-44, f"Reg. No. {reg}      Signed: {signed}")
     c.drawString(M, rule_y-56, f"Document ID: {doc_id}")
     # QR placeholder bottom-right
-    _qr_placeholder(c, W-M-46, M+6, 46, doc_id)
+    _qr_placeholder(c, W-M-46, M+6, 46, doc_id, verify_url)
     c.setFont("Helvetica", 6); c.setFillColor(MUTED)
     _tier = (brand or {}).get("tier"); _bn = (brand or {}).get("name")
     _via = (_bn if _tier == "whitelabel" and _bn else "NanoHab Connect")

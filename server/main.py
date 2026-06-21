@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.29.0")
+app = FastAPI(title="NanoHab Connect API", version="0.30.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3171,6 +3171,28 @@ def export_note_pdf(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Could not store export: {e}")
 
+    # register the issued document (source of truth for the public verify page).
+    # Stores ONLY verification facts (signer identity, dates, branding, status) —
+    # never clinical content, so the verify page is leak-proof.
+    _snap_v = art.get("approver_snapshot") or {}
+    try:
+        client.table("issued_documents").insert({
+            "doc_id": doc_id,
+            "artifact_id": artifact_id,
+            "room_id": art["room_id"],
+            "signer_name": _snap_v.get("full_name"),
+            "signer_credentials": _snap_v.get("credentials"),
+            "signer_reg_no": _snap_v.get("registration_no"),
+            "signed_at": _snap_v.get("signed_at"),
+            "branding_profile_id": (profile_id or None),
+            "branding_name": (brand or {}).get("name"),
+            "branding_tier": (brand or {}).get("tier"),
+            "status": "valid",
+            "issued_by_member": member_id,
+        }).execute()
+    except Exception:
+        pass
+
     # audit (non-PHI metadata only)
     _audit(client, actor_member_id=member_id, action="export",
            target_type="artifact", target_id=artifact_id, room_id=art["room_id"],
@@ -3182,4 +3204,34 @@ def export_note_pdf(
     url = _attachment_signed_url(client, EXPORT_BUCKET, path, 300)
     return {"doc_id": doc_id, "url": url, "expires_in": 300,
             "branding_tier": (brand or {}).get("tier")}
+
+
+# ============================================================================
+# Layer 2b — PUBLIC document verification (no auth). Given a doc_id, return ONLY
+# leak-proof facts: signer identity, dates, status, and (for re-skinning) the
+# issuing brand. NEVER returns clinical content. Anyone holding the paper can
+# scan the QR, so this must reveal nothing about the patient.
+# ============================================================================
+@app.get("/verify/{doc_id}")
+def verify_document(doc_id: str):
+    client = get_service_client()
+    rows = (client.table("issued_documents")
+            .select("doc_id, signer_name, signer_credentials, signer_reg_no, "
+                    "signed_at, issued_at, branding_name, branding_tier, status")
+            .eq("doc_id", doc_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Document not found")
+    d = rows[0]
+    tier = d.get("branding_tier")
+    issuer = d.get("branding_name") if (tier == "whitelabel" and d.get("branding_name")) else "NanoHab Connect"
+    return {
+        "doc_id": d["doc_id"],
+        "status": d.get("status") or "valid",
+        "signed_by": d.get("signer_name"),
+        "credentials": d.get("signer_credentials"),
+        "registration_no": d.get("signer_reg_no"),
+        "signed_at": d.get("signed_at"),
+        "issued_at": d.get("issued_at"),
+        "verified_by": issuer,
+    }
 
