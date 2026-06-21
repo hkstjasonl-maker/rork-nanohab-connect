@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import { ChevronDown, ChevronUp, Inbox, Check } from "lucide-react-native";
+import { ChevronDown, ChevronUp, Inbox, Check, FileDown } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -19,6 +19,7 @@ import { Theme } from "@/constants/colors";
 import { supabase } from "@/lib/supabase";
 import SignatureBlock, { type ApproverSnapshot } from "@/components/SignatureBlock";
 import ApprovalGate from "@/components/ApprovalGate";
+import ExportSheet from "@/components/ExportSheet";
 import { fetchRoomReviewRequests, markReviewDone, type ReviewRequest } from "@/lib/reviews";
 import { getCurrentMemberId } from "@/lib/member";
 
@@ -54,6 +55,7 @@ export default function NoteReviewScreen() {
   const { artifactId } = useLocalSearchParams<{ artifactId: string }>();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const [exportOpen, setExportOpen] = useState(false);
   const queryClient = useQueryClient();
   const myIdQuery = useQuery({ queryKey: ["my-member-id"], queryFn: getCurrentMemberId });
   const myMemberId = myIdQuery.data ?? null;
@@ -386,6 +388,11 @@ export default function NoteReviewScreen() {
                 <Text style={styles.readText}>{finalText}</Text>
               </View>
               <SignatureBlock snapshot={artifact.approver_snapshot} />
+              <Pressable style={styles.exportRow} onPress={() => setExportOpen(true)}>
+                <FileDown size={18} color={Theme.primary} />
+                <Text style={styles.exportRowText}>Export as PDF</Text>
+              </Pressable>
+              <ExportSheet artifactId={artifactId} visible={exportOpen} onClose={() => setExportOpen(false)} />
             </View>
           ) : null}
 
@@ -430,6 +437,8 @@ const styles = StyleSheet.create({
     borderColor: Theme.border,
     padding: 16,
   },
+  exportRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 14, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10, borderWidth: 1, borderColor: Theme.primary, alignSelf: "flex-start" },
+  exportRowText: { color: Theme.primary, fontWeight: "700", fontSize: 15 },
   readText: { fontSize: 16, color: Theme.text, lineHeight: 23 },
   editor: {
     minHeight: 160,
