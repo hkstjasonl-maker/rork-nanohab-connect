@@ -123,6 +123,51 @@ function ProfileCard({ p, me, onChange }: { p: Profile; me: Me | null; onChange:
     }
   };
 
+
+  // Who can manage this profile's logo: the owning member, or an org admin of its org.
+  const canManage =
+    !!me &&
+    ((p.owner_member_id && p.owner_member_id === me.id) ||
+      (!!p.owner_org_id && me.org_id === p.owner_org_id && me.org_role === "org_owner"));
+  const [logoBusy, setLogoBusy] = useState(false);
+
+  const uploadLogo = async () => {
+    setErr(null);
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) { setErr("Photo access is needed to add a logo."); return; }
+      const res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 1,
+      });
+      if (res.canceled || !res.assets?.length) return;
+      const asset = res.assets[0];
+      setLogoBusy(true);
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("No active session.");
+      const form = new FormData();
+      form.append("file", {
+        uri: asset.uri,
+        name: asset.fileName ?? "logo.png",
+        type: asset.mimeType ?? "image/png",
+      } as any);
+      const up = await fetch(
+        `${process.env.EXPO_PUBLIC_BACKEND_URL}/branding/${p.id}/logo`,
+        { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form },
+      );
+      if (!up.ok) {
+        if (up.status === 415) throw new Error("Logo must be a PNG or JPG image.");
+        if (up.status === 413) throw new Error("Logo must be 2 MB or smaller.");
+        if (up.status === 403) throw new Error("You can't change this profile's logo.");
+        throw new Error("Could not upload the logo. Please try again.");
+      }
+      onChange();
+    } catch (e: any) {
+      setErr(e?.message ?? "Could not upload the logo.");
+    } finally {
+      setLogoBusy(false);
+    }
+  };
   return (
     <View style={styles.card}>
       <View style={styles.cardTop}>
@@ -139,6 +184,16 @@ function ProfileCard({ p, me, onChange }: { p: Profile; me: Me | null; onChange:
             {busy === "rejected" ? <ActivityIndicator color={Theme.text} size="small" /> : <Text style={styles.rejectText}>Reject</Text>}
           </Pressable>
         </View>
+      ) : null}
+      {canManage ? (
+        <Pressable style={styles.logoRow} onPress={uploadLogo} disabled={logoBusy}>
+          {logoBusy ? <ActivityIndicator color={Theme.primary} size="small" /> : (
+            <>
+              <ImageIcon size={16} color={Theme.primary} />
+              <Text style={styles.logoRowText}>{p.logo_path ? "Change logo" : "Add logo"}</Text>
+            </>
+          )}
+        </Pressable>
       ) : null}
       {err ? <Text style={styles.err}>{err}</Text> : null}
     </View>
