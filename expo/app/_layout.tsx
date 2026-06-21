@@ -45,6 +45,7 @@ function RootLayoutNav() {
         options={{ headerShown: false, presentation: "fullScreenModal" }}
       />
       <Stack.Screen name="settings" options={{ title: "Settings" }} />
+      <Stack.Screen name="branding" options={{ title: "Practice profiles" }} />
     </Stack>
   );
 }

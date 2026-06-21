@@ -14,6 +14,7 @@ import { Theme } from "@/constants/colors";
 import { signOut } from "@/lib/auth";
 import { getCurrentMemberId } from "@/lib/member";
 import { supabase } from "@/lib/supabase";
+import { ChevronRight } from "lucide-react-native";
 
 type MemberProfile = {
   fullName: string;
@@ -99,6 +100,13 @@ export default function SettingsScreen() {
       )}
 
       <Pressable
+        style={({ pressed }) => [styles.navRow, pressed && styles.navRowPressed]}
+        onPress={() => router.push("/branding")}
+      >
+        <Text style={styles.navRowText}>Practice profiles</Text>
+        <ChevronRight size={20} color={Theme.textMuted} />
+      </Pressable>
+      <Pressable
         style={({ pressed }) => [
           styles.signOut,
           pressed && styles.signOutPressed,
@@ -138,6 +146,9 @@ const styles = StyleSheet.create({
   },
   value: { fontSize: 17, color: Theme.text },
   divider: { height: 1, backgroundColor: Theme.border },
+  navRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderWidth: 1, borderColor: Theme.border, borderRadius: 12, paddingVertical: 16, paddingHorizontal: 18 },
+  navRowPressed: { backgroundColor: Theme.surface },
+  navRowText: { color: Theme.text, fontSize: 16, fontWeight: "600" },
   signOut: {
     borderWidth: 1,
     borderColor: Theme.border,
