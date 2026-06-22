@@ -20,6 +20,7 @@ import { supabase } from "@/lib/supabase";
 import SignatureBlock, { type ApproverSnapshot } from "@/components/SignatureBlock";
 import ApprovalGate from "@/components/ApprovalGate";
 import ExportSheet from "@/components/ExportSheet";
+import WetSignSheet from "@/components/WetSignSheet";
 import { fetchRoomReviewRequests, markReviewDone, type ReviewRequest } from "@/lib/reviews";
 import { getCurrentMemberId } from "@/lib/member";
 
@@ -56,6 +57,7 @@ export default function NoteReviewScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const [exportOpen, setExportOpen] = useState(false);
+  const [wetOpen, setWetOpen] = useState(false);
   const queryClient = useQueryClient();
   const myIdQuery = useQuery({ queryKey: ["my-member-id"], queryFn: getCurrentMemberId });
   const myMemberId = myIdQuery.data ?? null;
@@ -393,6 +395,11 @@ export default function NoteReviewScreen() {
                 <Text style={styles.exportRowText}>Export as PDF</Text>
               </Pressable>
               <ExportSheet artifactId={artifactId} visible={exportOpen} onClose={() => setExportOpen(false)} />
+              <Pressable style={styles.exportRow} onPress={() => setWetOpen(true)}>
+                <FileDown size={18} color={Theme.primary} />
+                <Text style={styles.exportRowText}>Attach signed paper copy</Text>
+              </Pressable>
+              <WetSignSheet artifactId={artifactId} visible={wetOpen} onClose={() => setWetOpen(false)} />
             </View>
           ) : null}
 
