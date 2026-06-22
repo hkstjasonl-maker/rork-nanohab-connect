@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi.responses import HTMLResponse as _HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import Client, create_client
 from livekit import api as livekit_api
