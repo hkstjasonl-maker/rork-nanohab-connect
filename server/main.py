@@ -92,7 +92,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.33.0")
+app = FastAPI(title="NanoHab Connect API", version="0.35.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3353,4 +3353,139 @@ def ops_set_profile_tier(
            target_type="practice_profile", target_id=profile_id,
            detail={"event": "profile_tier_set", "from": old, "to": tier, "by": "operator"})
     return {"ok": True, "profile_id": profile_id, "branding_tier": tier}
+
+
+# ============================================================================
+# Operator approval portal — review pending practice profiles (anti-impersonation).
+# All behind require_operator. Shows ONLY profile identity, never clinical content
+# (the operator-governs-without-reading-the-patient rule). Audited as operator actions.
+# ============================================================================
+@app.get("/ops/profiles/pending")
+def ops_profiles_pending(x_operator_key: str = Header(default="")):
+    require_operator(x_operator_key)
+    client = get_service_client()
+    rows = (client.table("practice_profiles")
+            .select("id, display_name, legal_name, address, registration_no, "
+                    "branding_tier, status, owner_org_id, owner_member_id, submitted_by, created_at")
+            .eq("status", "pending").order("created_at", desc=False).execute().data) or []
+    # enrich with the submitting member's identity (name/credentials) for the reviewer
+    out = []
+    for p in rows:
+        sub = p.get("submitted_by") or p.get("owner_member_id")
+        submitter = None
+        if sub:
+            mr = (client.table("members").select("full_name, credentials, registration_no")
+                  .eq("id", sub).limit(1).execute().data) or []
+            submitter = mr[0] if mr else None
+        out.append({
+            "id": p["id"], "display_name": p.get("display_name"),
+            "legal_name": p.get("legal_name"), "address": p.get("address"),
+            "registration_no": p.get("registration_no"),
+            "branding_tier": p.get("branding_tier"),
+            "scope": "org" if p.get("owner_org_id") else "personal",
+            "created_at": p.get("created_at"),
+            "submitter": submitter,
+        })
+    return {"pending": out, "count": len(out)}
+
+@app.post("/ops/profiles/{profile_id}/review")
+def ops_profiles_review(
+    profile_id: str,
+    decision: str = Body(..., embed=True),
+    note: str = Body(default="", embed=True),
+    x_operator_key: str = Header(default=""),
+):
+    require_operator(x_operator_key)
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision must be approved or rejected")
+    client = get_service_client()
+    rows = (client.table("practice_profiles").select("id, status")
+            .eq("id", profile_id).limit(1).execute().data) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    client.table("practice_profiles").update({
+        "status": decision, "review_note": (note or None),
+    }).eq("id", profile_id).execute()
+    _audit(client, actor_member_id=None, action="draft",
+           target_type="practice_profile", target_id=profile_id,
+           detail={"event": "profile_reviewed", "decision": decision,
+                   "note": (note or None), "by": "operator"})
+    return {"ok": True, "profile_id": profile_id, "status": decision}
+
+
+# ============================================================================
+# Operator portal PAGE (HTML). Served at GET /ops/portal. The page itself is public
+# HTML, but every DATA call it makes requires the operator key (entered by the staffer
+# and sent as the X-Operator-Key header). No clinical content ever reaches this page.
+# ============================================================================
+@app.get("/ops/portal", response_class=_HTMLResponse)
+def ops_portal_page():
+    html = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>NanoHab Operator - Profile review</title>
+<style>
+  :root{--ink:#16241f;--muted:#5E726B;--line:#E4E9E6;--teal:#0F6E56;--bg:#F6F4EF;--amber:#9A6B12;--red:#B42318}
+  *{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+  header{background:#fff;border-bottom:1px solid var(--line);padding:16px 22px;display:flex;align-items:center;justify-content:space-between}
+  h1{font-size:17px;margin:0;font-weight:750}
+  main{max-width:880px;margin:0 auto;padding:22px}
+  .keybar{display:flex;gap:8px;margin-bottom:18px}
+  input{flex:1;padding:11px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px}
+  button{padding:11px 16px;border:0;border-radius:9px;background:var(--teal);color:#fff;font-weight:650;font-size:14px;cursor:pointer}
+  button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+  button.reject{background:#fff;color:var(--red);border:1px solid var(--red)}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}
+  .name{font-size:16px;font-weight:700}
+  .pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;background:#FBF0DC;color:var(--amber)}
+  .facts{margin:10px 0 0;font-size:13.5px;color:var(--muted);line-height:1.6}
+  .facts b{color:var(--ink);font-weight:600}
+  .acts{display:flex;gap:8px;margin-top:12px}
+  .empty{color:var(--muted);padding:30px;text-align:center}
+  .note{font-size:12px;color:var(--muted);margin-top:6px}
+</style></head>
+<body>
+<header><h1>NanoHab Operator &middot; Practice-profile review</h1></header>
+<main>
+  <div class="keybar">
+    <input id="key" type="password" placeholder="Operator key" autocomplete="off">
+    <button onclick="load()">Load pending</button>
+  </div>
+  <div id="list"><div class="empty">Enter the operator key and load pending profiles.</div></div>
+  <p class="note">This surface shows profile identity only. It never displays clinical content.</p>
+</main>
+<script>
+  function hdr(){return {'X-Operator-Key':document.getElementById('key').value,'Content-Type':'application/json'}}
+  async function load(){
+    const r=await fetch('/ops/profiles/pending',{headers:hdr()});
+    const el=document.getElementById('list');
+    if(!r.ok){el.innerHTML='<div class="empty">Key rejected or error ('+r.status+').</div>';return;}
+    const d=await r.json();
+    if(!d.count){el.innerHTML='<div class="empty">No pending profiles.</div>';return;}
+    el.innerHTML=d.pending.map(function(p){
+      var s=p.submitter||{};
+      return '<div class="card"><div class="row"><div class="name">'+esc(p.display_name||'')+'</div>'
+        +'<span class="pill">'+esc(p.scope)+' &middot; '+esc(p.branding_tier||'cobrand')+'</span></div>'
+        +'<div class="facts">'
+        +(p.legal_name?'<div><b>Legal:</b> '+esc(p.legal_name)+'</div>':'')
+        +(p.registration_no?'<div><b>Reg no:</b> '+esc(p.registration_no)+'</div>':'')
+        +(p.address?'<div><b>Address:</b> '+esc(p.address)+'</div>':'')
+        +(s.full_name?'<div><b>Submitted by:</b> '+esc(s.full_name)+(s.credentials?' &middot; '+esc(s.credentials):'')+(s.registration_no?' &middot; '+esc(s.registration_no):'')+'</div>':'')
+        +'</div>'
+        +'<div class="acts"><button onclick="review(\''+p.id+'\',\'approved\')">Approve</button>'
+        +'<button class="reject" onclick="review(\''+p.id+'\',\'rejected\')">Reject</button></div></div>';
+    }).join('');
+  }
+  async function review(id,decision){
+    var note='';
+    if(decision==='rejected'){note=prompt('Reason for rejection (optional):')||'';}
+    const r=await fetch('/ops/profiles/'+id+'/review',{method:'POST',headers:hdr(),body:JSON.stringify({decision:decision,note:note})});
+    if(r.ok){load();}else{alert('Failed: '+r.status);}
+  }
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+</script>
+</body></html>"""
+    return _HTMLResponse(content=html)
 
