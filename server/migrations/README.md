@@ -16,3 +16,7 @@ this folder starts at 042. Backfill earlier ones here when convenient.
 - 046_issued_documents.sql     — registry of issued PDFs (source of truth for the public verify page); leak-proof
 
 ## Status: all of the above are APPLIED in production as of 2026-06-21.
+
+- 047_branding_bucket.sql     -- private 'branding' bucket + set_profile_logo RPC (logo upload) [APPLIED]
+- 048_profile_tier.sql        -- governed branding_tier: member set_profile_tier cobrand-only + operator upgrade [APPLIED]
+- 049_wet_sign.sql            -- Sign-off Layer 3: issued_documents.wet_signed_* + 'signed-scans' bucket [PENDING]
