@@ -48,6 +48,7 @@ def render_verify_html(doc: dict | None, doc_id: str) -> str:
           <div class="row"><dt>Date signed</dt><dd>{signed}</dd></div>
           <div class="row"><dt>Issued</dt><dd>{issued}</dd></div>
           <div class="row"><dt>Document ID</dt><dd class="mono">{did}</dd></div>
+          {f'<div class="row"><dt>Paper copy</dt><dd>A countersigned paper copy is on file</dd></div>' if (doc or {}).get("has_wet_signed_copy") else ""}
         </dl>"""
 
     return f"""<!doctype html>

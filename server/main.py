@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.38.0")
+app = FastAPI(title="NanoHab Connect API", version="0.39.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3225,7 +3225,7 @@ def verify_document(doc_id: str):
     client = get_service_client()
     rows = (client.table("issued_documents")
             .select("doc_id, signer_name, signer_credentials, signer_reg_no, "
-                    "signed_at, issued_at, branding_name, branding_tier, status")
+                    "signed_at, issued_at, branding_name, branding_tier, status, wet_signed_at")
             .eq("doc_id", doc_id).limit(1).execute().data) or []
     if not rows:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -3638,4 +3638,75 @@ def list_issued_documents(artifact_id: str, authorization: str = Header(default=
         "has_wet_signed_copy": bool(r.get("wet_signed_at")),
     } for r in rows]
     return {"documents": docs, "count": len(docs)}
+
+
+# ============================================================================
+# /d/{doc_id} — the public HTML verify page (what the printed QR points to).
+# verifypage.py ships in the image but was never wired; this serves it. Same
+# leak-proof data as /verify (identity + dates + status only), plus a truthful
+# "paper copy on file" flag when a wet-signed scan exists.
+# ============================================================================
+import verifypage as _verifypage
+
+def _load_verify_doc(doc_id: str):
+    client = get_service_client()
+    rows = (client.table("issued_documents")
+            .select("doc_id, signer_name, signer_credentials, signer_reg_no, "
+                    "signed_at, issued_at, branding_name, branding_tier, status, wet_signed_at")
+            .eq("doc_id", doc_id).limit(1).execute().data) or []
+    if not rows:
+        return None
+    d = rows[0]
+    tier = d.get("branding_tier")
+    issuer = d.get("branding_name") if (tier == "whitelabel" and d.get("branding_name")) else "NanoHab Connect"
+    return {
+        "doc_id": d["doc_id"],
+        "status": d.get("status") or "valid",
+        "signed_by": d.get("signer_name"),
+        "credentials": d.get("signer_credentials"),
+        "registration_no": d.get("signer_reg_no"),
+        "signed_at": d.get("signed_at"),
+        "issued_at": d.get("issued_at"),
+        "verified_by": issuer,
+        "has_wet_signed_copy": bool(d.get("wet_signed_at")),
+    }
+
+@app.get("/d/{doc_id}", response_class=_HTMLResponse)
+def verify_page(doc_id: str):
+    doc = _load_verify_doc(doc_id)
+    html_str = _verifypage.render_verify_html(doc, doc_id)
+    return _HTMLResponse(content=html_str)
+
+
+# ============================================================================
+# View a wet-signed scan (in-app, for room members only). The scan is PHI in a
+# private bucket; this mints a short-TTL signed URL. NEVER public, NEVER on the
+# verify page. Reuses the proven _attachment_signed_url helper.
+# ============================================================================
+@app.get("/note/{artifact_id}/scan/{doc_id}")
+def get_wet_signed_scan(artifact_id: str, doc_id: str, authorization: str = Header(default="")):
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+    arows = (client.table("ai_artifacts")
+             .select("id, room_id").eq("id", artifact_id).limit(1).execute().data) or []
+    if not arows:
+        raise HTTPException(status_code=404, detail="Note not found")
+    room_id = arows[0]["room_id"]
+    mem = (client.table("room_members").select("id")
+           .eq("room_id", room_id).eq("member_id", member_id).limit(1).execute().data) or []
+    if not mem:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    drows = (client.table("issued_documents")
+             .select("doc_id, artifact_id, wet_signed_scan_path")
+             .eq("doc_id", doc_id).limit(1).execute().data) or []
+    if not drows or drows[0].get("artifact_id") != artifact_id:
+        raise HTTPException(status_code=400, detail="Document ID does not match this note")
+    path = drows[0].get("wet_signed_scan_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No signed copy on file")
+    url = _attachment_signed_url(client, "signed-scans", path, 300)
+    if not url:
+        raise HTTPException(status_code=500, detail="Could not create link")
+    return {"url": url}
 
