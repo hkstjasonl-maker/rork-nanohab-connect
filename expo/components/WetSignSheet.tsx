@@ -21,17 +21,24 @@ export default function WetSignSheet({ artifactId, visible, onClose }: Props) {
   useEffect(() => {
     if (!visible) return;
     setErr(null); setDone(false); setPicked(null);
-    // list issued documents for this artifact so the user pairs the right one
-    supabase
-      .from("issued_documents")
-      .select("doc_id, issued_at, branding_tier")
-      .eq("artifact_id", artifactId)
-      .order("issued_at", { ascending: false })
-      .then(({ data }) => {
-        const list = (data ?? []) as IssuedDoc[];
+    // list issued documents via the membership-gated backend (issued_documents is
+    // service-role only; the app cannot query it directly).
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        const token = data.session?.access_token;
+        if (!token) return;
+        const r = await fetch(`${process.env.EXPO_PUBLIC_BACKEND_URL}/note/${artifactId}/issued-documents`,
+          { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) { setErr("Could not load this note's documents."); return; }
+        const j = await r.json();
+        const list = (j.documents ?? []) as IssuedDoc[];
         setDocs(list);
         if (list.length === 1) setPicked(list[0].doc_id);
-      });
+      } catch (e: any) {
+        setErr(e?.message ?? "Could not load documents.");
+      }
+    })();
   }, [visible, artifactId]);
 
   const upload = async () => {

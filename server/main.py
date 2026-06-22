@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.37.0")
+app = FastAPI(title="NanoHab Connect API", version="0.38.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3607,4 +3607,35 @@ def pair_wet_signed_scan(
         raise HTTPException(status_code=500, detail=f"Could not record scan: {e}")
 
     return {"ok": True, "doc_id": doc_id, "wet_signed_at": now}
+
+
+# ============================================================================
+# List a note's issued documents (for the app's WetSign sheet). issued_documents
+# is service-role only (leak-proof), so the app cannot query it directly; this
+# endpoint returns the minimal list (doc_id + dates + whether a scan is paired)
+# gated by room membership. No clinical content.
+# ============================================================================
+@app.get("/note/{artifact_id}/issued-documents")
+def list_issued_documents(artifact_id: str, authorization: str = Header(default="")):
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+    arows = (client.table("ai_artifacts")
+             .select("id, room_id").eq("id", artifact_id).limit(1).execute().data) or []
+    if not arows:
+        raise HTTPException(status_code=404, detail="Note not found")
+    room_id = arows[0]["room_id"]
+    mem = (client.table("room_members").select("id")
+           .eq("room_id", room_id).eq("member_id", member_id).limit(1).execute().data) or []
+    if not mem:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    rows = (client.table("issued_documents")
+            .select("doc_id, issued_at, branding_tier, wet_signed_at")
+            .eq("artifact_id", artifact_id).order("issued_at", desc=True).execute().data) or []
+    docs = [{
+        "doc_id": r["doc_id"], "issued_at": r.get("issued_at"),
+        "branding_tier": r.get("branding_tier"),
+        "has_wet_signed_copy": bool(r.get("wet_signed_at")),
+    } for r in rows]
+    return {"documents": docs, "count": len(docs)}
 
