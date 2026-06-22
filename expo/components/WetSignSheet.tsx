@@ -2,13 +2,13 @@
 // approved, exported note, pairing it to a chosen issued document (doc_id).
 // Reuses the proven multipart-upload pattern (logo picker) + Modal/Pressable backdrop.
 import React, { useEffect, useState } from "react";
-import { Modal, View, Text, Pressable, StyleSheet, ActivityIndicator, ScrollView } from "react-native";
+import { Modal, View, Text, Pressable, StyleSheet, ActivityIndicator, ScrollView, Linking } from "react-native";
 import * as ImagePicker from "expo-image-picker";
-import { X, FileUp, Check } from "lucide-react-native";
+import { X, FileUp, Check, Eye } from "lucide-react-native";
 import { Theme } from "@/constants/colors";
 import { supabase } from "@/lib/supabase";
 
-type IssuedDoc = { doc_id: string; issued_at: string; branding_tier: string | null };
+type IssuedDoc = { doc_id: string; issued_at: string; branding_tier: string | null; has_wet_signed_copy?: boolean };
 type Props = { artifactId: string; visible: boolean; onClose: () => void };
 
 export default function WetSignSheet({ artifactId, visible, onClose }: Props) {
@@ -74,6 +74,21 @@ export default function WetSignSheet({ artifactId, visible, onClose }: Props) {
     }
   };
 
+  const viewScan = async (docId: string) => {
+    setErr(null);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) throw new Error("No active session.");
+      const r = await fetch(`${process.env.EXPO_PUBLIC_BACKEND_URL}/note/${artifactId}/scan/${docId}`,
+        { headers: { Authorization: `Bearer ${token}` } });
+      if (!r.ok) throw new Error("Could not open the signed copy.");
+      const j = await r.json();
+      if (j.url) Linking.openURL(j.url);
+    } catch (e: any) {
+      setErr(e?.message ?? "Could not open the signed copy.");
+    }
+  };
   if (!visible) return null;
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -101,6 +116,12 @@ export default function WetSignSheet({ artifactId, visible, onClose }: Props) {
                   <Pressable key={d.doc_id} style={[styles.row, picked === d.doc_id && styles.rowActive]} onPress={() => setPicked(d.doc_id)}>
                     <Text style={[styles.rowText, picked === d.doc_id && styles.rowTextActive]}>{d.doc_id}</Text>
                     {picked === d.doc_id ? <Check size={18} color={Theme.primary} /> : null}
+                    {d.has_wet_signed_copy ? (
+                      <Pressable onPress={() => viewScan(d.doc_id)} hitSlop={8} style={styles.viewLink}>
+                        <Eye size={15} color={Theme.textMuted} />
+                        <Text style={styles.viewLinkText}>View signed copy</Text>
+                      </Pressable>
+                    ) : null}
                   </Pressable>
                 ))}
               </ScrollView>
@@ -127,6 +148,8 @@ const styles = StyleSheet.create({
   muted: { color: Theme.textMuted, fontSize: 14, paddingVertical: 12 },
   row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10, backgroundColor: "#F4F7F6", marginBottom: 6 },
   rowActive: { backgroundColor: "#E6F1ED", borderWidth: 1, borderColor: Theme.primary },
+  viewLink: { flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 },
+  viewLinkText: { color: Theme.textMuted, fontSize: 12.5, fontWeight: "600" },
   rowText: { fontSize: 14, color: Theme.text, fontFamily: "Menlo" },
   rowTextActive: { fontWeight: "700", color: Theme.primary },
   err: { color: "#B42318", fontSize: 13, marginTop: 8 },
