@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.36.0")
+app = FastAPI(title="NanoHab Connect API", version="0.37.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3523,4 +3523,88 @@ def ops_portal_page():
 </script>
 </body></html>"""
     return _HTMLResponse(content=html)
+
+
+# ============================================================================
+# Sign-off Layer 3 — pair a wet-ink-signed PAPER scan to an issued document.
+# The scan is an ADDITION to the e-signed original. Reuses B5 image security
+# (sniff/cap/strip). Stored in the private 'signed-scans' bucket. Audited.
+# ============================================================================
+SIGNED_SCANS_BUCKET = "signed-scans"
+_SCAN_CAP = 10 * 1024 * 1024  # 10 MB (a scanned page photo/PDF)
+
+@app.post("/note/{artifact_id}/wet-sign")
+def pair_wet_signed_scan(
+    artifact_id: str,
+    doc_id: str = Form(...),
+    file: UploadFile = File(...),
+    authorization: str = Header(default=""),
+):
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    # the artifact must exist and the caller must be a member of its room
+    arows = (client.table("ai_artifacts")
+             .select("id, room_id").eq("id", artifact_id).limit(1).execute().data) or []
+    if not arows:
+        raise HTTPException(status_code=404, detail="Note not found")
+    room_id = arows[0]["room_id"]
+    mem = (client.table("room_members").select("id")
+           .eq("room_id", room_id).eq("member_id", member_id).limit(1).execute().data) or []
+    if not mem:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # the doc_id must be an issued document FOR THIS artifact (no blind pairing)
+    drows = (client.table("issued_documents")
+             .select("doc_id, artifact_id").eq("doc_id", doc_id).limit(1).execute().data) or []
+    if not drows or drows[0].get("artifact_id") != artifact_id:
+        raise HTTPException(status_code=400, detail="Document ID does not match this note")
+
+    raw = file.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(raw) > _SCAN_CAP:
+        raise HTTPException(status_code=413, detail="Scan must be 10 MB or smaller")
+
+    kind = _sniff_attachment_kind(raw)
+    if kind not in ("png", "jpeg", "pdf"):
+        raise HTTPException(status_code=415, detail="Scan must be a PNG, JPG, or PDF")
+
+    # images: strip metadata; pdf stored as-is (a scanned PDF rarely carries GPS, and
+    # re-encoding a PDF is lossy/complex -- consistent with B5's pdf handling).
+    body = raw
+    ext = ".pdf"
+    ctype = "application/pdf"
+    if kind in ("png", "jpeg"):
+        try:
+            body = _strip_image_to_bytes(raw, kind)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail=f"Could not process scan: {e}")
+        ext = ".png"; ctype = "image/png"
+
+    storage_path = f"{room_id}/{artifact_id}/{_secrets.token_hex(12)}{ext}"
+    try:
+        client.storage.from_(SIGNED_SCANS_BUCKET).upload(
+            storage_path, body, {"content-type": ctype, "upsert": "false"})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+
+    try:
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        client.table("issued_documents").update({
+            "wet_signed_scan_path": storage_path,
+            "wet_signed_at": now,
+            "wet_signed_by": member_id,
+        }).eq("doc_id", doc_id).execute()
+        _audit(client, actor_member_id=member_id, action="draft",
+               target_type="artifact", target_id=artifact_id, room_id=room_id,
+               detail={"event": "wet_sign_scan_paired", "doc_id": doc_id})
+    except Exception as e:  # noqa: BLE001
+        try: client.storage.from_(SIGNED_SCANS_BUCKET).remove([storage_path])
+        except Exception: pass
+        raise HTTPException(status_code=500, detail=f"Could not record scan: {e}")
+
+    return {"ok": True, "doc_id": doc_id, "wet_signed_at": now}
 
