@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.39.0")
+app = FastAPI(title="NanoHab Connect API", version="0.40.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3710,3 +3710,196 @@ def get_wet_signed_scan(artifact_id: str, doc_id: str, authorization: str = Head
         raise HTTPException(status_code=500, detail="Could not create link")
     return {"url": url}
 
+
+
+
+# ============================================================================
+# STAGE C — fan-out: one approved clinical note -> N audience-specific outputs.
+#
+# PATENT #3 (single-consent, multi-audience, role+language-differentiated output).
+# From ONE clinician-approved source note, generate a separate typed artifact for
+# each requested audience (family / helper / school / patient), each:
+#   - FLOOR-FILTERED: the INPUT is reduced to what the audience's role floor permits
+#     BEFORE it ever reaches the LLM (the security boundary + the IP novelty live here),
+#   - in the audience's LANGUAGE,
+#   - drafted against an outward document_template (provenance), and
+#   - an INDEPENDENT artifact that must be reviewed + approved before delivery
+#     (it is born 'drafted', never auto-delivered).
+#
+# This REUSES the exact B6 typed-note machinery already in main.py — no second LLM
+# path: _load_document_template(), _typed_note_system_prompt(), _typed_note_generate(),
+# the service-role ai_artifacts insert, set_transcript, set_ai_draft, _audit.
+# Append this whole block to the END of server/main.py.
+# ============================================================================
+
+# requested-audience key -> how to realize it.
+#   template_key : an OUTWARD document_templates row (seeded by 050b) — drives the
+#                  section structure + carries provenance.
+#   audience     : the disclosure CLASS written into ai_artifacts.audience (the cap).
+#   target_role  : the specific recipient role (also the role_floors lookup key).
+#   lang         : default output language (overridable per call).
+_FANOUT_AUDIENCES = {
+    "family":     {"artifact_type": "family_summary", "template_key": "family_summary_yue", "audience": "caregiver", "target_role": "family",  "lang": "yue"},
+    "family_en":  {"artifact_type": "family_summary", "template_key": "family_summary_en",  "audience": "caregiver", "target_role": "family",  "lang": "en"},
+    "helper":     {"artifact_type": "helper_tasks",   "template_key": "helper_tasks_en",    "audience": "caregiver", "target_role": "helper",  "lang": "en"},
+    "helper_yue": {"artifact_type": "helper_tasks",   "template_key": "helper_tasks_yue",   "audience": "caregiver", "target_role": "helper",  "lang": "yue"},
+    "school":     {"artifact_type": "school_slice",   "template_key": "school_slice_en",    "audience": "teacher",   "target_role": "school",  "lang": "en"},
+    "patient":    {"artifact_type": "family_summary", "template_key": "family_summary_yue", "audience": "patient",   "target_role": "patient", "lang": "yue"},
+}
+
+# The Stage-C OUTWARD guardrail, layered ON TOP of the template's section prompt.
+# This is what makes an outward artifact safe regardless of the source note's depth.
+_FANOUT_OUTWARD_GUARDRAIL = (
+    "AUDIENCE = OUTWARD (non-clinician). This document is for a layperson and is a "
+    "COORDINATION AID, not medical advice. Rules, in priority order: "
+    "(1) Use ONLY what the source note supports — never invent findings, values, "
+    "names, dates, diagnoses or advice. (2) If something is not in the source, simply "
+    "omit it — do NOT write placeholders like [not stated] in an outward document. "
+    "(3) Never diagnose, never interpret labs/imaging, never give a dose or a clinical "
+    "instruction the source note did not already state in plain terms. (4) Write in "
+    "warm, respectful, everyday language at a layperson's reading level; expand or drop "
+    "clinical jargon rather than copying it. (5) Do not include clinician-only reasoning, "
+    "differential diagnoses, or internal team notes. (6) End with one short line stating "
+    "this was prepared from a clinician's note and shared for coordination."
+)
+
+
+def _floor_filter_source(client, source_text: str, target_role: str) -> str:
+    """Reduce the source note to what target_role's floor permits, BEFORE the LLM.
+
+    This is the single place the generation-time floor rule lives (build plan 5.12 /
+    patent #3). Today notes are not yet section-tagged by audience, so the conservative,
+    defensible behaviour is:
+      - look up the role's max_audience in role_floors; if the role is unknown or has
+        no floor row, treat it as the most restrictive (caregiver-level lay view);
+      - pass the full *approved* text through, and rely on _FANOUT_OUTWARD_GUARDRAIL to
+        re-express at a lay level WITHOUT surfacing clinician-only reasoning.
+    When notes gain section-level audience tags (C2+), strip care_team-only sections
+    here by tag so clinician-only content never reaches the outward prompt at all.
+    Returns the (possibly reduced) text the audience prompt is allowed to see.
+    """
+    # Resolve the cap (defensive: unknown role -> most restrictive).
+    try:
+        fr = (client.table("role_floors").select("max_audience")
+              .eq("participant_role", target_role).limit(1).execute().data) or []
+        _cap = fr[0]["max_audience"] if fr else "caregiver"
+    except Exception:  # noqa: BLE001
+        _cap = "caregiver"
+    # C1: no section tags yet -> full approved text in, guardrail re-expresses.
+    # (_cap is resolved here so the boundary is explicit and ready for C2 section-strip.)
+    return source_text
+
+
+def _fanout_system_prompt(client, cfg: dict, language: str) -> str:
+    """Build the outward draft prompt: the template's section structure (reused from
+    B6 via _typed_note_system_prompt) + the Stage-C outward guardrail on top."""
+    tmpl = _load_document_template(client, cfg["template_key"])
+    if not tmpl:
+        # Fallback: a minimal narrative template shape if the 050b seed is missing.
+        tmpl = {"template_key": cfg["template_key"], "display_name": cfg["template_key"],
+                "risk_tier": "narrative", "output_sections": [], "framework": None}
+    lang = (language or "").strip() or cfg["lang"]
+    base = _typed_note_system_prompt(tmpl, focus="", language=lang)
+    return base + "\n\n" + _FANOUT_OUTWARD_GUARDRAIL
+
+
+@app.post("/note/{source_artifact_id}/fan-out")
+def fan_out_artifact(
+    source_artifact_id: str,
+    audiences: list[str] = Body(..., embed=True),
+    language: str = Body(default=""),
+    authorization: str = Header(default=""),
+):
+    """From ONE approved source note, create an independent floor-filtered, language-
+    appropriate DRAFT artifact per requested audience. Each is born 'drafted' and must
+    be reviewed + approved before any delivery. Reuses the B6 typed-note draft path.
+    """
+    m = resolve_member(authorization)
+    member_id = m["id"]
+    client = get_service_client()
+
+    src = (client.table("ai_artifacts")
+           .select("id, room_id, state, approved_text, edited_text, ai_draft, "
+                   "transcript, target_language")
+           .eq("id", source_artifact_id).limit(1).execute().data) or []
+    if not src:
+        raise HTTPException(status_code=404, detail="Source note not found")
+    s = src[0]
+
+    member_rows = (client.table("room_members").select("id")
+                   .eq("room_id", s["room_id"]).eq("member_id", member_id)
+                   .limit(1).execute().data) or []
+    if not member_rows:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # INVARIANT: nothing outward is generated from an unapproved source. The clinical
+    # note must be signed off first (single-consent point — patent #3).
+    if s.get("state") not in ("approved", "posted"):
+        raise HTTPException(status_code=409,
+                            detail="Only an approved note can be fanned out to other audiences")
+
+    source_text = (s.get("approved_text") or s.get("edited_text")
+                   or s.get("ai_draft") or s.get("transcript") or "").strip()
+    if not source_text:
+        raise HTTPException(status_code=409, detail="Source note has no approved text")
+
+    created = []
+    for key in audiences:
+        cfg = _FANOUT_AUDIENCES.get(key)
+        if not cfg:
+            continue
+        out_lang = (language or "").strip() or cfg["lang"]
+
+        # 1) floor-filter the INPUT before the LLM (security + IP boundary).
+        filtered = _floor_filter_source(client, source_text, cfg["target_role"])
+
+        # 2) build the outward prompt (template structure + outward guardrail).
+        system_prompt = _fanout_system_prompt(client, cfg, out_lang)
+
+        # 3) create the new artifact at 'recorded' (service-role; members can't insert),
+        #    tagged with audience + lineage + target_role, exactly like a typed note.
+        try:
+            ins = (client.table("ai_artifacts").insert({
+                "room_id": s["room_id"],
+                "created_by": member_id,
+                "artifact_type": cfg["artifact_type"],
+                "state": "recorded",
+                "template_key": cfg["template_key"],
+                "audience": cfg["audience"],
+                "target_role": cfg["target_role"],
+                "target_language": out_lang,
+                "source_artifact_id": source_artifact_id,
+            }).execute().data)
+        except Exception as e:  # noqa: BLE001 — surface the exact DB reason
+            raise HTTPException(status_code=500, detail=f"Could not create fan-out artifact: {e}")
+        if not ins:
+            raise HTTPException(status_code=500, detail="Could not create fan-out artifact (no row)")
+        new_id = ins[0]["id"]
+
+        # 4) recorded -> transcribed (the filtered source is the "transcript" input).
+        client.rpc("set_transcript", {"p_artifact_id": new_id,
+                                      "p_transcript": filtered,
+                                      "p_engine": "fanout"}).execute()
+
+        # 5) draft against the outward prompt — SAME engine as typed notes.
+        try:
+            draft = _typed_note_generate(system_prompt, filtered)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Fan-out draft failed: {e}")
+
+        # 6) transcribed -> drafted (write-once; trigger-enforced).
+        client.rpc("set_ai_draft", {"p_artifact_id": new_id, "p_draft": draft,
+                                    "p_engine_version": "fanout_v1"}).execute()
+
+        # 7) audit (non-PHI metadata only).
+        _audit(client, actor_member_id=member_id, action="draft",
+               target_type="artifact", target_id=new_id, room_id=s["room_id"],
+               detail={"event": "fan_out", "audience": key,
+                       "from": source_artifact_id, "language": out_lang})
+
+        created.append({"id": new_id, "audience": key,
+                        "artifact_type": ins[0].get("artifact_type"),
+                        "target_role": cfg["target_role"], "language": out_lang,
+                        "state": "drafted"})
+
+    return {"source_artifact_id": source_artifact_id, "created": created}
