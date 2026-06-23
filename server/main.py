@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.40.0")
+app = FastAPI(title="NanoHab Connect API", version="0.41.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3800,7 +3800,7 @@ def _fanout_system_prompt(client, cfg: dict, language: str) -> str:
                 "risk_tier": "narrative", "output_sections": [], "framework": None}
     lang = (language or "").strip() or cfg["lang"]
     base = _typed_note_system_prompt(tmpl, focus="", language=lang)
-    return base + "\n\n" + _FANOUT_OUTWARD_GUARDRAIL
+    return base + "\n\n" + _FANOUT_OUTWARD_GUARDRAIL + "\n\n" + iddsi_reference_block(lang)
 
 
 @app.post("/note/{source_artifact_id}/fan-out")
@@ -3903,3 +3903,157 @@ def fan_out_artifact(
                         "state": "drafted"})
 
     return {"source_artifact_id": source_artifact_id, "created": created}
+
+
+# === Stage C IDDSI knowledge (locale-correct descriptors + safety content) ===
+# ============================================================================
+# iddsi_knowledge.py — locale-correct IDDSI descriptors + safety content.
+#
+# Injected into the Stage C fan-out prompt as a REFERENCE GLOSSARY the model must
+# use verbatim WHERE RELEVANT. It does NOT force this content into every output —
+# the never-invent rule still governs: the model surfaces the avoid-list / medication
+# / transitional-food lines ONLY when the source clinician note actually involves
+# diet texture or medication. When it does, it must use the exact locale terminology.
+#
+# Terminology sources (locale-correct, confirmed):
+#   HK 繁中  : HKU Swallowing Research Lab (swallow.edu.hku.hk) + HK clinical handbooks
+#   TW 繁中  : Taiwan hospital consensus (Kaohsiung Medical / Chang Gung / NCKU)
+#   CN 简中  : Mainland 2019 geriatric-medicine IDDSI consensus
+#   EN       : IDDSI official English descriptors
+# Safety content sources: IDDSI official (Framework, consumer handouts, V2.2 detailed
+#   definitions, FAQ), peer-reviewed (Drugs & Aging 2023; Dysphagia/Springer 2017),
+#   NHS/university trusts (St George's, Cambridge Univ Hospitals, Alberta Health),
+#   pharmacy guidance (NEWT). NOT from CareFood HK or HKCSS/社聯.
+#
+# IDDSI Framework & descriptors © The International Dysphagia Diet Standardisation
+# Initiative 2019/2025, https://iddsi.org/framework — licensed CC BY-SA 4.0
+# (language translation permitted; descriptor modification NOT permitted).
+# ============================================================================
+
+# locale code used by the fan-out -> the IDDSI locale column to use.
+# yue / zh-Hant-HK -> HK; zh-Hant-TW -> TW; zh-Hans / zh-Hans-CN -> CN; else EN.
+def iddsi_locale(language: str) -> str:
+    l = (language or "").strip().lower()
+    if l in ("yue", "zh-hant-hk", "zh-hk"):
+        return "HK"
+    if l in ("zh-hant-tw", "zh-tw"):
+        return "TW"
+    if l in ("zh-hans", "zh-hans-cn", "zh-cn", "cmn-hans"):
+        return "CN"
+    if l.startswith("zh-hant"):
+        return "HK"   # default Traditional -> HK register for this product
+    if l.startswith("zh"):
+        return "CN"
+    return "EN"
+
+# Per-level descriptor, locale-correct. Format: level -> {locale: "label"}.
+IDDSI_LEVELS = {
+    0: {"EN": "Level 0 Thin",                 "HK": "等級0 稀薄",            "TW": "第0級 稀薄",            "CN": "0级 稀薄"},
+    1: {"EN": "Level 1 Slightly Thick",       "HK": "等級1 極微稠",          "TW": "第1級 極微稠",          "CN": "1级 轻微稠"},
+    2: {"EN": "Level 2 Mildly Thick",         "HK": "等級2 低度稠",          "TW": "第2級 低度稠",          "CN": "2级 稍微稠"},
+    3: {"EN": "Level 3 Moderately Thick / Liquidised",
+        "HK": "等級3 中度稠（杰）/ 流質", "TW": "第3級 中度稠 / 流質",   "CN": "3级 中度稠 / 流态型"},
+    4: {"EN": "Level 4 Extremely Thick / Pureed",
+        "HK": "等級4 高度稠（杰）/ 糊狀", "TW": "第4級 高度稠 / 糊狀",   "CN": "4级 高度稠 / 糊状（细泥型）"},
+    5: {"EN": "Level 5 Minced & Moist",       "HK": "等級5 細碎及濕軟",      "TW": "第5級 細碎及濕軟",      "CN": "5级 细馅型（细碎及湿软）"},
+    6: {"EN": "Level 6 Soft & Bite-Sized",    "HK": "等級6 軟質及一口量",    "TW": "第6級 軟質及一口量",    "CN": "6级 软质型及一口量"},
+    7: {"EN": "Level 7 Regular / Easy to Chew",
+        "HK": "等級7 食物原狀 / 容易咀嚼", "TW": "第7級 食物原狀 / 容易咀嚼", "CN": "7级 常规 / 易嚼型"},
+}
+
+# Foods-to-avoid guidance, expressed per locale at a lay register. These are SAFETY
+# EDUCATION (generic), not a substitute for the SLT's individual assessment — the
+# prompt frames them that way. Bread/nuts are the documented headline exclusions.
+_AVOID_EN = (
+    "Foods to avoid at texture-modified levels (choking risk): hard or dry foods (nuts, raw "
+    "vegetables like carrot/cauliflower/broccoli, dry cake, dry cereal); BREAD (IDDSI does not "
+    "allow bread at Levels 3-6 — it cannot be broken into safe pieces; bread is only a Level 7 "
+    "food after a clinician has assessed it); tough or fibrous foods (steak, pineapple); chewy "
+    "or sticky foods (lollies, marshmallows, sticky rice, chewing gum, dried fruit); anything "
+    "with pips, seeds, skins, husks or bones; mixed thin-and-thick textures (soup with pieces, "
+    "cereal in milk). At Level 6 / Easy-to-Chew, pieces must be no larger than 1.5 cm. Nuts "
+    "cannot be made safe at Levels 4-6."
+)
+_AVOID_HK = (
+    "唔適合食嘅嘢（會哽親）：硬或者乾嘅嘢（果仁、生菜如紅蘿蔔/椰菜花/西蘭花、乾蛋糕、乾麥片）；"
+    "麵包（IDDSI 第3至6級都唔可以食麵包，因為麵包整唔到安全嘅細粒；麵包只屬第7級，而且要言語治療師評估過先可以）；"
+    "韌或者多筋嘅嘢（牛扒、菠蘿）；黐或者韌嘅嘢（糖、棉花糖、糯米、香口膠、果乾）；有核、有籽、有皮、有殼或者有骨嘅嘢；"
+    "稀同稠溝埋一齊（湯入面有粒、麥片加奶）。第6級／容易咀嚼嘅食物，每件唔可以大過1.5厘米。果仁喺第4至6級都整唔到安全。"
+)
+_AVOID_TW = (
+    "不適合食用的食物（易嗆咳／哽塞）：硬或乾的食物（堅果、生菜如紅蘿蔔/花椰菜/青花菜、乾蛋糕、乾麥片）；"
+    "麵包（IDDSI 第3至6級不可使用麵包，因無法製成安全的小顆粒；麵包僅屬第7級，且須語言治療師評估後）；"
+    "韌或多纖維的食物（牛排、鳳梨）；黏或韌的食物（糖果、棉花糖、糯米、口香糖、果乾）；有核、籽、皮、殼或骨的食物；"
+    "稀稠混合質地（湯中有顆粒、麥片加牛奶）。第6級／容易咀嚼的食物，每塊不可大於1.5公分。堅果在第4至6級皆無法製成安全質地。"
+)
+_AVOID_CN = (
+    "不宜食用的食物（易呛咳／噎食）：硬或干的食物（坚果、生蔬菜如胡萝卜/菜花/西兰花、干蛋糕、干麦片）；"
+    "面包（IDDSI 第3至6级不可使用面包，因无法做成安全的小颗粒；面包仅属第7级，且须言语治疗师评估后）；"
+    "韧或多纤维的食物（牛排、菠萝）；黏或韧的食物（糖果、棉花糖、糯米、口香糖、果干）；带核、籽、皮、壳或骨的食物；"
+    "稀稠混合质地（汤里有颗粒、麦片加奶）。第6级／易嚼食物，每块不可大于1.5厘米。坚果在第4至6级均无法做成安全质地。"
+)
+IDDSI_AVOID = {"EN": _AVOID_EN, "HK": _AVOID_HK, "TW": _AVOID_TW, "CN": _AVOID_CN}
+
+# Transitional-foods caveat (only surfaced if the source note raises them).
+_TRANS_EN = (
+    "Transitional foods (e.g. wafers, ice chips, certain crisps, ice cream) start firm and melt "
+    "or break down with saliva or warmth. They MELT TO A THIN LIQUID in the mouth, so they may be "
+    "UNSAFE for someone who cannot safely take thin liquids. Each one must be tested and approved "
+    "by the speech therapist for this specific person — never assume."
+)
+_TRANS_HK = (
+    "過渡質地食物（例如威化餅、碎冰、某些薯片、雪糕）開始時係硬，遇到口水或者溫度就會溶或者散開。"
+    "佢哋喺口入面會變成稀薄嘅液體，所以對唔可以飲稀液體嘅人嚟講可能唔安全。每一款都要言語治療師為呢位病人試過同批准先可以用，唔好估。"
+)
+_TRANS_TW = (
+    "過渡質地食物（如威化餅、碎冰、某些洋芋片、冰淇淋）起初為固體，遇唾液或溫度即融化或崩解。"
+    "它們在口中會變成稀薄液體，對無法安全飲用稀液體者可能不安全。每一種都須由語言治療師為該病人測試並核准後才可使用，切勿臆測。"
+)
+_TRANS_CN = (
+    "过渡质地食物（如威化饼、碎冰、某些薯片、冰淇淋）起初为固体，遇唾液或温度即融化或崩解。"
+    "它们在口中会变成稀薄液体，对无法安全饮用稀液体者可能不安全。每一种都须由言语治疗师为该患者测试并核准后才可使用，切勿臆测。"
+)
+IDDSI_TRANSITIONAL = {"EN": _TRANS_EN, "HK": _TRANS_HK, "TW": _TRANS_TW, "CN": _TRANS_CN}
+
+# Medication-modification guidance (only surfaced if the source note involves medication).
+# NEVER instruct crushing/altering — always route to pharmacist/doctor.
+_MED_EN = (
+    "Medicines: never crush, split, open or change a medicine on your own. Some tablets (enteric-"
+    "coated, slow/extended-release) become dangerous if crushed, and a syrup is not automatically "
+    "safer (it may need thickening). Always ask the pharmacist or doctor first, and give medicines "
+    "exactly the way they set up."
+)
+_MED_HK = (
+    "食藥：唔好自己壓碎、剝開、拆開或者更改任何藥物。有啲藥丸（腸溶衣、緩釋／長效）壓碎咗會有危險，"
+    "藥水都唔一定安全（可能要加凝固粉）。任何更改都要先問藥劑師或者醫生，並且要完全按照佢哋嘅指示畀藥。"
+)
+_MED_TW = (
+    "用藥：請勿自行壓碎、剝開、拆開或更改任何藥物。有些藥錠（腸溶衣、緩釋／長效）壓碎後會有危險，"
+    "藥水也不一定較安全（可能需增稠）。任何更改都應先諮詢藥師或醫師，並完全依照其指示給藥。"
+)
+_MED_CN = (
+    "用药：请勿自行压碎、掰开、拆开或更改任何药物。有些药片（肠溶衣、缓释／长效）压碎后会有危险，"
+    "糖浆也不一定更安全（可能需增稠）。任何更改都应先咨询药师或医师，并完全按照其指示给药。"
+)
+IDDSI_MEDICATION = {"EN": _MED_EN, "HK": _MED_HK, "TW": _MED_TW, "CN": _MED_CN}
+
+
+def iddsi_reference_block(language: str) -> str:
+    """The locale-correct IDDSI reference the fan-out prompt injects. The prompt instructs
+    the model to (a) use the exact level descriptor verbatim if the source note names a level,
+    (b) include the foods-to-avoid / transitional / medication lines ONLY when the source note
+    involves diet texture or medication, and (c) never invent a level or instruction."""
+    loc = iddsi_locale(language)
+    levels = "; ".join(IDDSI_LEVELS[i][loc] for i in range(8))
+    return (
+        "IDDSI REFERENCE (use this terminology EXACTLY; do not translate or paraphrase the "
+        "level names). Levels for this reader's locale: " + levels + ".\n"
+        "If — and only if — the clinician note involves food texture or a diet level, include a "
+        "short plain-language 'foods to avoid' note appropriate to the stated level, drawn from: "
+        + IDDSI_AVOID[loc] + "\n"
+        "If — and only if — the note involves transitional foods, include: " + IDDSI_TRANSITIONAL[loc] + "\n"
+        "If — and only if — the note involves medication, include: " + IDDSI_MEDICATION[loc] + "\n"
+        "Do NOT invent a diet level the note did not state. Foods-to-avoid is general safety "
+        "education and does not replace the speech therapist's individual assessment. Never tell "
+        "anyone to crush or change medicine — always route that to the pharmacist or doctor."
+    )
