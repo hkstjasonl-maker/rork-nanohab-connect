@@ -4057,3 +4057,57 @@ def iddsi_reference_block(language: str) -> str:
         "education and does not replace the speech therapist's individual assessment. Never tell "
         "anyone to crush or change medicine — always route that to the pharmacist or doctor."
     )
+
+
+
+# ============================================================================
+# STAGE D — corporate layer: org directory endpoint.
+#
+# PATENT #1 (contact-less, case-anchored, institution-owned care-graph). The DIRECTORY
+# needs the backend because it reads ACROSS members (service-role; a member can't list
+# colleagues via RLS). The REFERRAL RPCs (create/accept/decline_referral, migration 051)
+# are MEMBER-LANE and are called CLIENT-SIDE via PostgREST with the member token, exactly
+# like create_attachment_transcript / approve_artifact — they resolve current_member_id()
+# from the JWT, which the backend service client does NOT have. So the only backend code
+# Stage D needs is this directory endpoint; the app calls the referral RPCs directly.
+#
+#   App referral calls (no backend endpoint needed):
+#     POST {SUPA}/rest/v1/rpc/create_referral
+#       body {p_case_id, p_to_member_id?, p_to_discipline?, p_reason?, p_room_id?}
+#     POST {SUPA}/rest/v1/rpc/accept_referral   body {p_referral_id, p_room_id?}
+#     POST {SUPA}/rest/v1/rpc/decline_referral  body {p_referral_id}
+#     GET  {SUPA}/rest/v1/referrals?to_member_id=eq.<me>&status=eq.sent   (RLS read)
+#   headers: { apikey: <anon>, Authorization: Bearer <member token>, Content-Type: application/json }
+#
+# Append this whole block to the END of server/main.py.
+# ============================================================================
+
+@app.get("/org/directory")
+def org_directory(
+    discipline: str = "",
+    language: str = "",
+    authorization: str = Header(default=""),
+):
+    """Find colleagues by discipline + language. Identity ONLY (name, discipline,
+    languages, credentials, registration_no) — never any clinical content. SAFE DEFAULT:
+    same-org colleagues. (A cross-org shared-room widening using shares_room_with() can
+    be added later; same-org is the conservative start.)
+    """
+    m = resolve_member(authorization)
+    member_org = m.get("org_id")
+    client = get_service_client()
+    q = (client.table("members")
+         .select("id, full_name, discipline, credentials, languages, registration_no, is_active")
+         .eq("org_id", member_org).eq("is_active", True))
+    if discipline:
+        q = q.eq("discipline", discipline)
+    rows = q.execute().data or []
+    # languages is an array column -> filter in Python (simpler than PostgREST cs/ov).
+    if language:
+        rows = [r for r in rows if language in (r.get("languages") or [])]
+    out = [{
+        "id": r["id"], "full_name": r.get("full_name"),
+        "discipline": r.get("discipline"), "credentials": r.get("credentials"),
+        "languages": r.get("languages") or [], "registration_no": r.get("registration_no"),
+    } for r in rows if r["id"] != m["id"]]  # exclude self
+    return {"members": out, "count": len(out)}
