@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.43.0")
+app = FastAPI(title="NanoHab Connect API", version="0.44.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3034,6 +3034,9 @@ def thread_typed_note(
 
     # 3) draft
     system_prompt = _typed_note_system_prompt(tmpl, focus, language)
+    _kpc = kp_clinician_block(client, text, language)
+    if _kpc:
+        system_prompt = system_prompt + "\n\n" + _kpc
     try:
         draft = _typed_note_generate(system_prompt, text)
     except Exception as e:  # noqa: BLE001
@@ -4217,5 +4220,65 @@ def kp_reference_block(client, source_text: str, language: str) -> str:
         "CLINICAL KNOWLEDGE REFERENCE (use ONLY where the note is genuinely about these "
         "topics; do not introduce a topic the note did not raise; use the wording as lay "
         "guidance, never as a diagnosis or instruction beyond what the note supports):\n"
+        + "\n\n".join(blocks)
+    )
+
+
+# ============================================================================
+# Clinician-tier injection — for the TYPED-NOTE endpoint ONLY (never the fan-out,
+# which is outward/lay). Surfaces intermediate + advanced tiers in professional
+# register, names frameworks (never reproduces items), and surfaces the
+# extract-flag boundaries so the draft never interprets labs/imaging/instrumental.
+# ============================================================================
+
+def _kp_clinician_block_for(pkg: dict, loc: str) -> str:
+    p = pkg.get("package") or {}
+    dn = (p.get("display_name") or {}).get(loc) or (p.get("display_name") or {}).get("EN") or pkg.get("topic_key")
+    tiers = p.get("tiers") or {}
+    inter = tiers.get("intermediate") or {}
+    adv = tiers.get("advanced") or {}
+    def g(d, field):
+        v = (d.get(field) or {})
+        return (v.get(loc) or v.get("EN") or "").strip()
+    parts = [f"[{dn}]"]
+    for label, field in (("clinical picture", "clinical_reference"),
+                         ("assessment", "assessment_considerations"),
+                         ("common management", "common_management"),
+                         ("scope / hand-off", "scope_handoff")):
+        val = g(inter, field)
+        if val: parts.append(f"- {label}: {val}")
+    for label, field in (("differential", "differential_considerations"),
+                         ("evidence notes", "evidence_notes")):
+        val = g(adv, field)
+        if val: parts.append(f"- {label}: {val}")
+    # frameworks: name + purpose only (never reproduce items)
+    fws = p.get("frameworks_scales") or []
+    if fws:
+        names = "; ".join(f"{f.get('name')} ({f.get('purpose','')})".strip() for f in fws if f.get("name"))
+        if names: parts.append(f"- named tools (reference only, do NOT reproduce items): {names}")
+    # extract-flag boundaries
+    ef = p.get("extract_flag_items") or []
+    if ef:
+        parts.append("- capture-and-flag (never interpret): " + " | ".join(ef))
+    return "\n".join(parts)
+
+
+def kp_clinician_block(client, source_text: str, language: str) -> str:
+    """Knowledge reference for the CLINICIAN'S OWN note draft (typed-note endpoint only).
+    Empty if no topic matches. Intermediate/advanced register; frameworks name-only;
+    extract-flag boundaries surfaced. The clinician reviews + approves the draft."""
+    pkgs = _kp_detect_packages(client, source_text)
+    if not pkgs:
+        return ""
+    loc = _kp_locale_key(language)
+    blocks = [_kp_clinician_block_for(p, loc) for p in pkgs]
+    blocks = [b for b in blocks if b.strip()]
+    if not blocks:
+        return ""
+    return (
+        "CLINICAL KNOWLEDGE REFERENCE (clinician-facing; use ONLY where the note is "
+        "genuinely about these topics; this is decision-support reference, not autonomous "
+        "advice; never reproduce assessment-tool items; never interpret labs, imaging or "
+        "instrumental findings — those are captured and flagged for the qualified clinician):\n"
         + "\n\n".join(blocks)
     )
