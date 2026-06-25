@@ -119,9 +119,23 @@ def _qr_placeholder(c, x, y, size, doc_id, verify_url=None):
 
 def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
               created_at=None, session_date=None, session_type=None,
-              template_name=None, doc_id="\u2014", verify_url="\u2014", brand=None):
+              template_name=None, doc_id="\u2014", verify_url="\u2014", brand=None,
+              artifact_type=None):
     P = PRESETS.get(style, PRESETS["hk_uk"])
     S = SIZES.get(size, SIZES["standard"])
+    # outward (family/helper/school) documents get a warm, family-facing header.
+    _OUTWARD = {"family_summary", "helper_tasks", "school_slice"}
+    _is_outward = (artifact_type or "") in _OUTWARD
+    _OUTWARD_SUBTITLE = {
+        "family_summary": "為家人而設的照顧摘要 · Care summary for family",
+        "helper_tasks":   "照顧者參考指引 · Care guide for the helper",
+        "school_slice":   "學校知會摘要 · Summary for school",
+    }
+    _OUTWARD_TITLE = {
+        "family_summary": "家人摘要 · Family summary",
+        "helper_tasks":   "照顧者指引 · Helper guide",
+        "school_slice":   "學校通知 · School note",
+    }
     W, H = P["page"]; cjk = P["cjk"]
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=P["page"])
@@ -170,13 +184,16 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
         c.setFillColor(TEAL); c.setFont("Helvetica-Bold", S["title"])
         c.drawString(M, y, "NanoHab Connect")
         c.setFont(cjk, S["body"]); c.setFillColor(MUTED)
-        c.drawRightString(W-M, y+2, "醫家動 \u00b7 Clinical Coordination Record")
+        c.drawRightString(W-M, y+2, (_OUTWARD_SUBTITLE.get(artifact_type) if _is_outward else "醫家動 \u00b7 Clinical Coordination Record"))
     y -= 8; c.setStrokeColor(bcolor); c.setLineWidth(1.4); c.line(M, y, W-M, y)
     y -= S["lead"]+6
 
     # title line: template + session type
-    title = template_name or "Clinical note"
-    if session_type: title += f"  \u00b7  {session_type.title()}"
+    if _is_outward:
+        title = _OUTWARD_TITLE.get(artifact_type) or "Care summary"
+    else:
+        title = template_name or "Clinical note"
+        if session_type: title += f"  \u00b7  {session_type.title()}"
     c.setFillColor(colors.black); c.setFont("Helvetica-Bold", S["lead"])
     c.drawString(M, y, title); y -= S["lead"]+2
 
@@ -227,7 +244,7 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
     rule_y = M + prov_h
     c.setStrokeColor(HAIR); c.setLineWidth(0.8); c.line(M, rule_y, W-M, rule_y)
     c.setFont("Helvetica-Bold", S["body"]); c.setFillColor(TEAL)
-    c.drawString(M, rule_y-14, "Electronically approved")
+    c.drawString(M, rule_y-14, ("Prepared by · 由臨床人員整理" if _is_outward else "Electronically approved"))
     role = ("  \u00b7  " + cred) if cred else ""
     c.setFont(cjk, S["body"]); c.setFillColor(colors.black)
     c.drawString(M, rule_y-30, f"{name}{role}")

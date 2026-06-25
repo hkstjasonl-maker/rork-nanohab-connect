@@ -3170,7 +3170,8 @@ def export_note_pdf(
             note_text=note_text, snapshot=art.get("approver_snapshot") or {},
             style=style, size=size, created_at=art.get("created_at"),
             session_date=art.get("session_date"), session_type=art.get("session_type"),
-            template_name=template_name, doc_id=doc_id, verify_url=verify_url, brand=brand)
+            template_name=template_name, doc_id=doc_id, verify_url=verify_url, brand=brand,
+            artifact_type=art.get("artifact_type"))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"PDF render failed: {e}")
 
