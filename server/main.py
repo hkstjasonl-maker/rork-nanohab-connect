@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.42.0")
+app = FastAPI(title="NanoHab Connect API", version="0.43.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -3790,7 +3790,7 @@ def _floor_filter_source(client, source_text: str, target_role: str) -> str:
     return source_text
 
 
-def _fanout_system_prompt(client, cfg: dict, language: str) -> str:
+def _fanout_system_prompt(client, cfg: dict, language: str, source_text: str = "") -> str:
     """Build the outward draft prompt: the template's section structure (reused from
     B6 via _typed_note_system_prompt) + the Stage-C outward guardrail on top."""
     tmpl = _load_document_template(client, cfg["template_key"])
@@ -3800,7 +3800,8 @@ def _fanout_system_prompt(client, cfg: dict, language: str) -> str:
                 "risk_tier": "narrative", "output_sections": [], "framework": None}
     lang = (language or "").strip() or cfg["lang"]
     base = _typed_note_system_prompt(tmpl, focus="", language=lang)
-    return base + "\n\n" + _FANOUT_OUTWARD_GUARDRAIL + "\n\n" + iddsi_reference_block(lang)
+    _kp = kp_reference_block(client, source_text, lang)
+    return base + "\n\n" + _FANOUT_OUTWARD_GUARDRAIL + "\n\n" + iddsi_reference_block(lang) + (("\n\n" + _kp) if _kp else "")
 
 
 @app.post("/note/{source_artifact_id}/fan-out")
@@ -3854,7 +3855,7 @@ def fan_out_artifact(
         filtered = _floor_filter_source(client, source_text, cfg["target_role"])
 
         # 2) build the outward prompt (template structure + outward guardrail).
-        system_prompt = _fanout_system_prompt(client, cfg, out_lang)
+        system_prompt = _fanout_system_prompt(client, cfg, out_lang, source_text)
 
         # 3) create the new artifact at 'recorded' (service-role; members can't insert),
         #    tagged with audience + lineage + target_role, exactly like a typed note.
@@ -4111,3 +4112,110 @@ def org_directory(
         "languages": r.get("languages") or [], "registration_no": r.get("registration_no"),
     } for r in rows if r["id"] != m["id"]]  # exclude self
     return {"members": out, "count": len(out)}
+
+
+# === knowledge_packages runtime injection ===
+# ============================================================================
+# kp_runtime.py — runtime injection of knowledge_packages into the fan-out prompt.
+#
+# Generalises the IDDSI reference-block pattern to all 59 packages. Given the approved
+# source note text + the reader's language, it (1) detects which topics the note is
+# actually about via match_terms, (2) pulls those packages' BASIC tier in the reader's
+# locale, and (3) builds a reference block the model uses WHERE RELEVANT — never-invent
+# still governs (reference only, surfaced only when the note is about that topic).
+#
+# Reads via the service client (knowledge_packages is server-side only). Caps at 3 topics
+# per note (ranked by match count) so a multi-topic note doesn't balloon the prompt.
+# Append this block to server/main.py (after the IDDSI block).
+# ============================================================================
+
+_KP_LOCALE = {  # language code -> package locale key
+    "yue": "zh-Hant-HK", "zh-hant-hk": "zh-Hant-HK", "zh-hk": "zh-Hant-HK",
+    "zh-hant-tw": "zh-Hant-TW", "zh-tw": "zh-Hant-TW",
+    "zh-hans": "zh-Hans-CN", "zh-hans-cn": "zh-Hans-CN", "zh-cn": "zh-Hans-CN",
+}
+def _kp_locale_key(language: str) -> str:
+    l = (language or "").strip().lower()
+    if l in _KP_LOCALE: return _KP_LOCALE[l]
+    if l.startswith("zh-hant"): return "zh-Hant-HK"
+    if l.startswith("zh"): return "zh-Hans-CN"
+    return "EN"
+
+_KP_MAX_TOPICS = 3  # cap packages injected per note
+
+
+def _kp_detect_packages(client, source_text: str, max_topics: int = _KP_MAX_TOPICS):
+    """Return up to max_topics packages whose match_terms appear in source_text,
+    ranked by number of distinct matching terms (strongest topic first)."""
+    text = (source_text or "").lower()
+    if not text:
+        return []
+    try:
+        rows = (client.table("knowledge_packages")
+                .select("discipline, topic_key, match_terms, package")
+                .eq("is_active", True).execute().data) or []
+    except Exception:  # noqa: BLE001 — never let KP lookup break drafting
+        return []
+    scored = []
+    for r in rows:
+        terms = r.get("match_terms") or []
+        hits = 0
+        owned_hit = 0
+        tk_phrase = (r.get("topic_key") or "").replace("_", " ").lower()
+        dn_en = (((r.get("package") or {}).get("display_name") or {}).get("EN") or "").lower()
+        for t in terms:
+            t = (t or "").strip().lower()
+            if len(t) >= 3 and t in text:
+                hits += 1
+                # a matched term the package itself OWNS (in its topic_key or display_name)
+                # ranks this package above one that only references the term tangentially.
+                if t and (t in tk_phrase or t in dn_en):
+                    owned_hit += 1
+        if hits > 0:
+            # sort key: total hits, then owned hits (primary-topic ownership tiebreak)
+            scored.append(((hits, owned_hit), r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:max_topics]]
+
+
+def _kp_basic_block_for(pkg: dict, loc: str) -> str:
+    """Render one package's BASIC tier in locale `loc` as a compact reference snippet."""
+    p = pkg.get("package") or {}
+    dn = (p.get("display_name") or {}).get(loc) or (p.get("display_name") or {}).get("EN") or pkg.get("topic_key")
+    basic = ((p.get("tiers") or {}).get("basic") or {})
+    def g(field):
+        v = (basic.get(field) or {})
+        return (v.get(loc) or v.get("EN") or "").strip()
+    parts = [f"[{dn}]"]
+    for label, field in (("what to watch for", "what_to_watch_for"),
+                         ("do / avoid", "things_to_do_or_avoid"),
+                         ("support", "support_tips"),
+                         ("when to seek help", "when_to_call")):
+        val = g(field)
+        if val:
+            parts.append(f"- {label}: {val}")
+    # safety guardrail (locale) — keep the model inside the lay/never-interpret line
+    sg = (p.get("safety_guardrails") or {})
+    sgv = (sg.get(loc) or sg.get("EN") or "").strip()
+    if sgv:
+        parts.append(f"- safety: {sgv}")
+    return "\n".join(parts)
+
+
+def kp_reference_block(client, source_text: str, language: str) -> str:
+    """The knowledge-package reference block injected into the fan-out prompt.
+    Empty string if the note matches no topic (so nothing is added spuriously)."""
+    pkgs = _kp_detect_packages(client, source_text)
+    if not pkgs:
+        return ""
+    loc = _kp_locale_key(language)
+    blocks = [_kp_basic_block_for(p, loc) for p in pkgs]
+    blocks = [b for b in blocks if b.strip()]
+    if not blocks:
+        return ""
+    return (
+        "CLINICAL KNOWLEDGE REFERENCE (use ONLY where the note is genuinely about these "
+        "topics; do not introduce a topic the note did not raise; use the wording as lay "
+        "guidance, never as a diagnosis or instruction beyond what the note supports):\n"
+        + "\n\n".join(blocks)
+    )
