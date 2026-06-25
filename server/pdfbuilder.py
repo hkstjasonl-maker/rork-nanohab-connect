@@ -194,7 +194,8 @@ def build_pdf(*, note_text, snapshot, style="hk_uk", size="standard",
     else:
         title = template_name or "Clinical note"
         if session_type: title += f"  \u00b7  {session_type.title()}"
-    c.setFillColor(colors.black); c.setFont("Helvetica-Bold", S["lead"])
+    c.setFillColor(colors.black)
+    c.setFont((cjk if _is_outward else "Helvetica-Bold"), S["lead"])
     c.drawString(M, y, title); y -= S["lead"]+2
 
     # dates row (issued immutable + session + late-entry flag)
