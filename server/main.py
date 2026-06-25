@@ -93,7 +93,7 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
 
-app = FastAPI(title="NanoHab Connect API", version="0.44.0")
+app = FastAPI(title="NanoHab Connect API", version="0.45.0")
 
 # CORS: permissive for now so the app/guest web can call during early build.
 # We will tighten allow_origins to the real app/web origins before launch.
@@ -4282,3 +4282,88 @@ def kp_clinician_block(client, source_text: str, language: str) -> str:
         "instrumental findings — those are captured and flagged for the qualified clinician):\n"
         + "\n\n".join(blocks)
     )
+
+
+# === knowledge lookup (#5 term lookup) ===
+# ============================================================================
+# kp_lookup_endpoint.py — membership-gated knowledge lookup (#5 term lookup).
+# Append to server/main.py. Any authenticated member may look up any topic at any
+# tier (the knowledge is reference, not patient data; reader chooses the tier).
+# Mirrors the directory endpoint: resolve_member -> service client -> JSON.
+# ============================================================================
+
+@app.get("/knowledge/lookup")
+def knowledge_lookup(
+    q: str = "",
+    tier: str = "basic",          # basic | intermediate | advanced
+    language: str = "",           # yue / zh-Hant-TW / zh-Hans-CN / en (else EN)
+    discipline: str = "",         # optional filter
+    authorization: str = Header(default=""),
+):
+    """Search the knowledge base by term and return matching topics with the chosen
+    tier's content in the reader's locale. Membership-gated (any member). No patient data."""
+    resolve_member(authorization)  # gate: must be an authenticated member
+    client = get_service_client()
+
+    tier = (tier or "basic").strip().lower()
+    if tier not in ("basic", "intermediate", "advanced"):
+        tier = "basic"
+    loc = _kp_locale_key(language)  # reuse the locale resolver from kp_runtime
+    needle = (q or "").strip().lower()
+
+    sel = (client.table("knowledge_packages")
+           .select("discipline, topic_key, display_name_en, match_terms, package")
+           .eq("is_active", True))
+    if discipline.strip():
+        sel = sel.eq("discipline", discipline.strip())
+    rows = (sel.execute().data) or []
+
+    def loc_of(d, *path):
+        cur = d
+        for p in path:
+            cur = (cur or {}).get(p) if isinstance(cur, dict) else None
+        if isinstance(cur, dict):
+            return cur.get(loc) or cur.get("EN") or ""
+        return ""
+
+    results = []
+    for r in rows:
+        pkg = r.get("package") or {}
+        terms = [t.lower() for t in (r.get("match_terms") or [])]
+        dn_en = (r.get("display_name_en") or "").lower()
+        # match: empty query returns all (browse mode); else term/display match
+        hit = (not needle) or (needle in dn_en) or any(needle in t or t in needle for t in terms)
+        if not hit:
+            continue
+        tiers = pkg.get("tiers") or {}
+        tblock = tiers.get(tier) or {}
+        # assemble the tier's locale content (skip the 'audience' meta key)
+        content = {}
+        for k, v in tblock.items():
+            if k == "audience":
+                continue
+            if isinstance(v, dict):
+                val = v.get(loc) or v.get("EN") or ""
+                if val:
+                    content[k] = val
+        results.append({
+            "discipline": r["discipline"],
+            "topic_key": r["topic_key"],
+            "display_name": loc_of(pkg, "display_name") or r.get("display_name_en"),
+            "one_line": loc_of(pkg, "one_line"),
+            "tier": tier,
+            "content": content,
+            # frameworks: name + purpose only (never reproduce items)
+            "frameworks": [
+                {"name": f.get("name"), "purpose": f.get("purpose")}
+                for f in (pkg.get("frameworks_scales") or []) if f.get("name")
+            ],
+            "safety": loc_of(pkg, "safety_guardrails"),
+        })
+    # rank: exact display/topic match first, then alphabetical
+    def rank(x):
+        dn = (x.get("display_name") or "").lower()
+        tk = x.get("topic_key", "").replace("_", " ")
+        return (0 if (needle and (needle in tk or needle in dn)) else 1, x.get("discipline",""), tk)
+    results.sort(key=rank)
+    return {"query": q, "tier": tier, "language": loc, "count": len(results), "results": results[:25]}
